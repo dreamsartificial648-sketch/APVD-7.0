@@ -1,8 +1,8 @@
-torch 
-torchvision 
-torchaudio 
-opencv-python 
-Pillow 
-numpy 
-PyYAML 
+torch
+torchvision
+torchaudio
+opencv-python
+Pillow
+numpy
+PyYAML
 mss
