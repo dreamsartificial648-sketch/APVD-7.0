@@ -8,18 +8,18 @@ How to get the app running:
 
 **Consumer Settings**
 
-Potato Mode
+**Potato Mode
 CPU / Chromebook-ish / old laptop
-FP32, low batch, 128–192 resolution
+FP32, low batch, 128–192 resolution**
 
-Laptop Safe
-FP32 or Auto, small batch, low workers
+**Laptop Safe
+FP32 or Auto, small batch, low workers**
 
-Normal GPU
-Auto precision, medium batch
+**Normal GPU
+Auto precision, medium batch**
 
-RTX 3060 12GB
-FP16/Auto, batch 32, strong prefetch/cache
+**RTX 3060 12GB
+FP16/Auto, batch 32, strong prefetch/cache**
 
 Monster GPU
 Higher batch, high cache, high resolution
