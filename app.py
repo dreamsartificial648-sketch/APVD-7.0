@@ -1,7 +1,7 @@
 """
-APVD v3.0 - AI Pixel Value Determinator
+APVD v7.0 - AI Pixel Value Determinator
 Tkinter GUI for VAE-based image variation generation with mini latent diffusion.
-Features: 
+Features:
 - Training controls (Epochs, Save/Load)
 - Generation Tools (Unique, Chaos Mode, Auto-Cycle)
 - Dream Cycle: Smoothly morphs between latent points using Slerp for constant velocity.
@@ -9,31 +9,39 @@ Features:
 - Memory evolution, latent presets, interactive breeding, and latent map recall.
 - Threaded Training with Stop Functionality
 """
+from __future__ import annotations
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from tkinter import simpledialog
-from datetime import datetime
-from pathlib import Path
-import time
-import random
-import threading
-import re
+import logging
 import math
 import os
+import platform
+import random
+import re
 import shutil
 import subprocess
+import sys
 import tarfile
+import threading
+import time
 import zipfile
-import platform
+from collections import OrderedDict
+from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 
-import torch
-import cv2
-import numpy as np
-from PIL import Image, ImageDraw, ImageFile
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+try:
+    import cv2
+    import numpy as np
+    import torch
+    import tkinter as tk
+    from PIL import Image, ImageDraw, ImageFile
+    from tkinter import filedialog, messagebox, simpledialog, ttk
+    from torch.utils.data import DataLoader, Dataset
+    from torchvision import transforms
+except Exception as e:
+    print("A required package is missing:", e)
+    input("Press Enter to exit...")
+    raise SystemExit(5) from e
 
 from memory_system import MemoryBank, breed_latents, parse_selection_indices, summarize_memory
 from model import VAE, vae_loss, latent_denoiser_loss, get_device
@@ -58,7 +66,42 @@ from utils import (
     load_training_images_from_paths,
     load_training_images_from_videos,
     tensor_to_pil,
+    rgb_to_wavelet,
+    wavelet_to_rgb
 )
+
+APP_BASE_DIR = Path(__file__).resolve().parent
+MEMORY_DIR = APP_BASE_DIR / "Memory"
+MODELS_DIR = APP_BASE_DIR / "Models"
+OUTPUTS_DIR = APP_BASE_DIR / "Outputs"
+DREAMIFY_OUTPUT_DIR = APP_BASE_DIR / "Dreamify_Output"
+DREAM_VIDEOS_DIR = APP_BASE_DIR / "Dream_Videos"
+TIMELAPSES_DIR = APP_BASE_DIR / "Timelapses"
+
+def _read_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+# Number of decoded/resized training tensors to keep warm in RAM.
+# This is treated as an approximate TOTAL cache budget and is split across
+# DataLoader workers so 8 workers does not accidentally become 8x the RAM use.
+DEFAULT_DATASET_CACHE_ITEMS = max(0, _read_int_env("APVD_DATASET_CACHE_ITEMS", 4096))
+
+logging.basicConfig(
+    level=os.environ.get("APVD_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("apvd")
+
+try:
+    from reconstruction_judge import ReconstructionJudge
+    from memory_finder import MemoryFinder
+except Exception:
+    logger.debug("Optional APVD judge/finder modules were not loaded.", exc_info=True)
+    ReconstructionJudge = None
+    MemoryFinder = None
 
 MAX_TRAINING_PREVIEW_IMAGES = 256
 TRAINING_VISUAL_PREVIEW_INTERVAL = 10
@@ -70,6 +113,12 @@ TRAINING_INTENSITY_CHOICES = [
     "50% Balanced",
     "75% Fast",
     "100% Maximum",
+]
+PRECISION_MODE_CHOICES = [
+    "Auto Recommended",
+    "FP32 Stable",
+    "FP16 Fast",
+    "BF16 Balanced",
 ]
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 PERSONALITY_PRESETS = {
@@ -135,32 +184,17 @@ def safe_torch_load(path, *, map_location=None):
     except TypeError:
         return torch.load(path, map_location=map_location)
 
-
 def slerp(val, low, high):
-    """
-    Spherical linear interpolation.
-    Maintains constant velocity through latent space.
-    """
-    # Normalize to unit vectors
     low_norm = low / torch.norm(low, dim=1, keepdim=True)
     high_norm = high / torch.norm(high, dim=1, keepdim=True)
-    
-    # Dot product
     dot = (low_norm * high_norm).sum(1)
-    
-    # Clamp for numerical stability
     dot = torch.clamp(dot, -1.0, 1.0)
-    
     omega = torch.acos(dot)
     so = torch.sin(omega)
-    
-    # Handle cases where points are very close (division by zero)
     if torch.all(so < 1e-6):
         return (1.0 - val) * low + val * high
-        
     res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
     return res
-
 
 class APVDDataset(Dataset):
     def __init__(
@@ -171,9 +205,12 @@ class APVDDataset(Dataset):
         video_paths: list[Path] | None = None,
         video_stride: int = 30,
         video_max_frames: int = 0,
+        wavelet_mode: bool = False,
+        cache_limit: int | None = None,
     ):
         self.image_paths = [Path(path) for path in image_paths]
         self.target_size = (int(target_resolution), int(target_resolution))
+        self.wavelet_mode = wavelet_mode
         self.transform = transforms.Compose(
             [
                 transforms.Resize(
@@ -184,11 +221,12 @@ class APVDDataset(Dataset):
             ]
         )
         self.fallback = torch.zeros(
-            3,
-            self.target_size[1],
-            self.target_size[0],
+            12 if wavelet_mode else 3,
+            self.target_size[1] // 2 if wavelet_mode else self.target_size[1],
+            self.target_size[0] // 2 if wavelet_mode else self.target_size[0],
             dtype=torch.float32,
         )
+
         self.video_stride = max(1, int(video_stride))
         self.video_max_frames = None if int(video_max_frames) <= 0 else int(video_max_frames)
         self.samples: list[tuple[str, object]] = [("path", path) for path in self.image_paths]
@@ -196,6 +234,9 @@ class APVDDataset(Dataset):
             self.samples.extend(("archive", (Path(ap), member)) for ap, member in archive_entries)
         if video_paths:
             self.samples.extend(self._build_video_samples(video_paths))
+
+        self.cache_limit = max(0, int(DEFAULT_DATASET_CACHE_ITEMS if cache_limit is None else cache_limit))
+        self._cache: OrderedDict[tuple[str, str], torch.Tensor] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -220,12 +261,7 @@ class APVDDataset(Dataset):
     @staticmethod
     def _member_is_image_file(member_name: str) -> bool:
         return Path(member_name).suffix.lower() in {
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".bmp",
-            ".gif",
-            ".webp",
+            ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp",
         }
 
     def _build_video_samples(self, video_paths: list[Path]) -> list[tuple[str, object]]:
@@ -247,6 +283,38 @@ class APVDDataset(Dataset):
                         return samples
         return samples
 
+    def _cache_key(self, kind: str, payload: object) -> tuple[str, str]:
+        return kind, str(payload)
+
+    def _get_cached(self, kind: str, payload: object) -> torch.Tensor | None:
+        if self.cache_limit <= 0:
+            return None
+        key = self._cache_key(kind, payload)
+        tensor = self._cache.get(key)
+        if tensor is not None:
+            self._cache.move_to_end(key)
+        return tensor
+
+    def _put_cached(self, kind: str, payload: object, tensor: torch.Tensor) -> torch.Tensor:
+        if self.cache_limit <= 0:
+            return tensor
+        key = self._cache_key(kind, payload)
+        self._cache[key] = tensor.detach().cpu()
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.cache_limit:
+            self._cache.popitem(last=False)
+        return tensor
+
+    def _pil_to_training_tensor(self, image: Image.Image) -> torch.Tensor:
+        try:
+            image.draft("RGB", self.target_size)
+        except Exception:
+            pass
+        tensor = self.transform(image.convert("RGB"))
+        if self.wavelet_mode:
+            tensor = rgb_to_wavelet(tensor)
+        return tensor
+
     def _load_archive_member(self, archive_path: Path, member_name: str) -> torch.Tensor:
         if not self._is_safe_archive_member(member_name) or self._skip_macosx_path(member_name):
             return self.fallback.clone()
@@ -266,9 +334,9 @@ class APVDDataset(Dataset):
                         return self.fallback.clone()
                     data = reader.read()
             with Image.open(BytesIO(data)) as img:
-                img = img.convert("RGB")
-                return self.transform(img)
+                return self._pil_to_training_tensor(img)
         except Exception:
+            logger.debug("Skipping unreadable archive image %s in %s", member_name, archive_path, exc_info=True)
             return self.fallback.clone()
 
     def _load_video_frame(self, video_path: Path, frame_index: int) -> torch.Tensor:
@@ -283,32 +351,37 @@ class APVDDataset(Dataset):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(np.ascontiguousarray(rgb))
             pil = pil.convert("RGB")
-            return self.transform(pil)
+            tensor = self.transform(pil)
+            if self.wavelet_mode:
+                tensor = rgb_to_wavelet(tensor)
+            return tensor
         except Exception:
+            logger.debug("Skipping unreadable video frame %s:%s", video_path, frame_index, exc_info=True)
             return self.fallback.clone()
         finally:
             cap.release()
 
     def __getitem__(self, index: int) -> torch.Tensor:
         kind, payload = self.samples[index]
+        cached = self._get_cached(kind, payload)
+        if cached is not None:
+            return cached
         try:
             if kind == "path":
                 path = Path(payload)
                 with Image.open(path) as img:
-                    img = img.convert("RGB")
-                    return self.transform(img)
+                    return self._put_cached(kind, payload, self._pil_to_training_tensor(img))
             if kind == "archive":
                 archive_path, member_name = payload
-                return self._load_archive_member(Path(archive_path), str(member_name))
+                return self._put_cached(kind, payload, self._load_archive_member(Path(archive_path), str(member_name)))
             if kind == "video":
                 video_path, frame_index = payload
-                return self._load_video_frame(Path(video_path), int(frame_index))
+                return self._put_cached(kind, payload, self._load_video_frame(Path(video_path), int(frame_index)))
             with Image.open(Path(payload)) as img:
-                img = img.convert("RGB")
-                return self.transform(img)
+                return self._put_cached(kind, payload, self._pil_to_training_tensor(img))
         except Exception:
+            logger.debug("Skipping unreadable training sample %s", payload, exc_info=True)
             return self.fallback.clone()
-
 
 class APVDApp:
     def __init__(self):
@@ -316,11 +389,12 @@ class APVDApp:
         self._closing = False
         self._after_ids: set[str] = set()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
-        self.root.title("APVD v6.0 - AI Pixel Value Determinator")
-        self.root.geometry("800x1000")
-        self.root.minsize(750, 950)
+        self.root.title("APVD v7.0 - AI Pixel Value Determinator")
+        self.root.geometry("800x1050")
+        self.root.minsize(750, 1000)
 
         self.device = get_device()
+        self.model_lock = threading.RLock()
         self.model: VAE | None = None
         self.latent_diffusion: DiffusionModel | None = None
         self.loaded_latent_diffusion_path: Path | None = None
@@ -339,8 +413,14 @@ class APVDApp:
         self.batch_size_var = tk.IntVar(value=16)
         self.loader_workers_var = tk.IntVar(value=4)
         self.prefetch_batches_var = tk.IntVar(value=2)
+        self.dataset_cache_items_var = tk.IntVar(value=DEFAULT_DATASET_CACHE_ITEMS)
         self.training_intensity_var = tk.StringVar(value="50% Balanced")
         self.learning_rate_var = tk.DoubleVar(value=2e-4)
+        # Precision Mode replaces the old mixed-precision checkbox, but
+        # mixed_precision_var is kept as a compatibility flag for older code/metadata.
+        self.precision_mode_var = tk.StringVar(value="Auto Recommended")
+        self.mixed_precision_var = tk.BooleanVar(value=True)
+        self.nan_guard_var = tk.BooleanVar(value=True)
         self.video_stride_var = tk.IntVar(value=30)
         self.video_max_frames_var = tk.IntVar(value=0)
         self.iterations_var = tk.IntVar(value=3)
@@ -376,12 +456,21 @@ class APVDApp:
         self.memory_training_limit_var = tk.IntVar(value=32)
         self.memory_recent_weight_var = tk.DoubleVar(value=0.7)
         self.dream_fps_var = tk.IntVar(value=16)
-        self.dream_video_seconds_var = tk.IntVar(value=5)
-        self.dream_video_fps_var = tk.IntVar(value=12)
-        self.latent_drift_var = tk.DoubleVar(value=0.25)
-        self.motion_smoothness_var = tk.DoubleVar(value=0.85)
-        self.dream_instability_var = tk.DoubleVar(value=0.15)
+        self.dream_video_seconds_var = tk.IntVar(value=20)
+        self.dream_video_fps_var = tk.IntVar(value=16)
+        self.dream_video_audio_mode_var = tk.StringVar(value="Silent")
+        self.dream_video_audio_source_var = tk.StringVar(value="")
+        self.dream_structure_video_source_var = tk.StringVar(value="")
+        self.dream_structure_guidance_var = tk.DoubleVar(value=0.72)
+        self.dream_autoregressive_var = tk.BooleanVar(value=True)
+        self.dream_feedback_strength_var = tk.DoubleVar(value=0.35)
+        self.latent_drift_var = tk.DoubleVar(value=0.18)
+        self.motion_smoothness_var = tk.DoubleVar(value=0.92)
+        self.dream_instability_var = tk.DoubleVar(value=0.05)
         self.evolution_count_var = tk.IntVar(value=6)
+        self.judge_top_k_var = tk.IntVar(value=2)
+        self.judge_min_score_var = tk.DoubleVar(value=0.45)
+        self.memory_finder_top_k_var = tk.IntVar(value=6)
         self.evolution_selection_var = tk.StringVar(value="")
         self.theme_mode_var = tk.StringVar(value="Auto")
         self.training_preview_enabled_var = tk.BooleanVar(value=False)
@@ -390,7 +479,12 @@ class APVDApp:
         self.device_choice_var = tk.StringVar(value=self._device_choice_from_device(self.device))
         self.hardware_status_var = tk.StringVar(value="")
         self.header_device_var = tk.StringVar(value="")
+        
+        # Reconstruction Mode
+        self.reconstruction_mode_var = tk.StringVar(value="RGB VAE")
+        
         self.is_training = False
+        self.training_thread: threading.Thread | None = None
         self.training_pause_event = threading.Event()
         self.training_pause_event.set()
         self.is_latent_diffusion_training = False
@@ -403,7 +497,6 @@ class APVDApp:
         self.model_cycle_active = False
         self.model_cycle_delay_ms = 2000
 
-        # Dream Cycle state
         self.current_latent = None
         self.target_latent = None
         self.interpolation_step = 0
@@ -419,7 +512,9 @@ class APVDApp:
         self.model_map_details_var = tk.StringVar(value="Select a .pt model to inspect its training details.")
         self.model_map_item_paths: dict[str, Path] = {}
         self.last_training_metadata: dict = {}
-        self.memory_bank = MemoryBank(Path("Memory"))
+        self.memory_bank = MemoryBank(MEMORY_DIR)
+        self.reconstruction_judge = None
+        self.memory_finder = None
 
         self.output_window: tk.Toplevel | None = None
         self.output_canvas: tk.Canvas | None = None
@@ -430,7 +525,6 @@ class APVDApp:
         self.live_challenge_window: tk.Toplevel | None = None
         self.live_challenge_canvas: tk.Canvas | None = None
         self._live_challenge_photo = None
-        # Stored custom region for capture (x, y, w, h) – None = use full monitor
         self._live_region: dict | None = None
         self.timelapse_run_dir: Path | None = None
         self.timelapse_frames_dir: Path | None = None
@@ -484,8 +578,14 @@ class APVDApp:
                 self._after_ids.discard(after_id)
 
     def _close(self):
-        self._stop_realtime_dreamify(update_status=False)
         self._closing = True
+        self.is_training = False
+        self.training_pause_event.set()
+        self._stop_realtime_dreamify(update_status=False)
+        train_thread = self.training_thread
+        if train_thread is not None and train_thread.is_alive() and threading.current_thread() is not train_thread:
+            train_thread.join(timeout=2.0)
+        self.training_thread = None
         self.auto_cycle_var.set(False)
         self.dream_cycle_var.set(False)
         self.model_cycle_active = False
@@ -505,8 +605,55 @@ class APVDApp:
         except tk.TclError:
             pass
 
+    def _get_reconstruction_mode(self) -> str:
+        return self.reconstruction_mode_var.get()
+
+    def _is_wavelet_mode(self) -> bool:
+        return self._get_reconstruction_mode() == "Wavelet"
+
+    def _is_rgb_mode(self) -> bool:
+        return self._get_reconstruction_mode() == "RGB VAE"
+
+    @staticmethod
+    def _wavelet_size_for_resolution(resolution: int) -> tuple[int, int]:
+        resolution = max(32, int(resolution))
+        if resolution % 2 != 0:
+            resolution += 1
+        return (resolution // 2, resolution // 2)
+
+    @staticmethod
+    def _rgb_size_for_wavelet_output(output_size: tuple[int, int]) -> tuple[int, int]:
+        if len(output_size) != 2:
+            return (256, 256)
+        return (int(output_size[0]) * 2, int(output_size[1]) * 2)
+
+    def _model_uses_wavelet(self) -> bool:
+        return self.model is not None and int(getattr(self.model, "in_channels", 3)) == 12
+
+    def _model_rgb_input_size(self) -> tuple[int, int]:
+        if self.model is None:
+            size = int(self.resolution_var.get())
+            return (size, size)
+        output_size = tuple(getattr(self.model, "output_size", (int(self.resolution_var.get()), int(self.resolution_var.get()))))
+        if self._model_uses_wavelet():
+            return self._rgb_size_for_wavelet_output(output_size)
+        return (int(output_size[0]), int(output_size[1]))
+
+    def _sanitize_model_batch(self, tensor: torch.Tensor, *, is_wavelet: bool) -> torch.Tensor:
+        if is_wavelet:
+            return torch.nan_to_num(tensor, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        return torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    def _decode_model_output_to_rgb(self, output_tensor: torch.Tensor, mode: str | None = None) -> torch.Tensor:
+        use_wavelet = (mode == "Wavelet") if mode is not None else (
+            self._model_uses_wavelet()
+            or (output_tensor.ndim >= 3 and int(output_tensor.shape[-3]) == 12)
+        )
+        if use_wavelet:
+            return wavelet_to_rgb(output_tensor).clamp(0.0, 1.0)
+        return output_tensor.clamp(0.0, 1.0)
+
     def _create_output_window(self):
-        """Second window: image-only view for OBS (window capture) without cropping the main UI."""
         if self.output_window is not None:
             try:
                 if self.output_window.winfo_exists():
@@ -569,7 +716,6 @@ class APVDApp:
                     self.live_overlay_window.geometry(f"{width}x{height}+0+0")
                     self.live_overlay_window.deiconify()
                     self.live_overlay_window.lift()
-                    # Keep window alpha=1.0; blending is done in software per-pixel.
                     self.live_overlay_window.attributes("-alpha", 1.0)
                     self.live_overlay_canvas.configure(width=width, height=height)
                     self._apply_live_overlay_clickthrough(clickthrough)
@@ -585,10 +731,6 @@ class APVDApp:
         w.configure(bg="black")
         w.overrideredirect(True)
         w.attributes("-topmost", True)
-        # Always use alpha=1.0 — the opacity slider now controls software blending
-        # between the raw desktop capture and VAE output, so the window itself is
-        # always fully opaque.  This eliminates the flicker that came from toggling
-        # the window-level alpha attribute every frame.
         w.attributes("-alpha", 1.0)
         w.geometry(f"{width}x{height}+0+0")
 
@@ -613,12 +755,7 @@ class APVDApp:
         self.live_overlay_canvas = None
         self._live_overlay_photo = None
 
-    # ── Challenge Window ──────────────────────────────────────────────────────
-
     def _create_live_challenge_window(self):
-        """Create the Challenge Window: a borderless always-on-top display for
-        dreamified frames that is NOT click-through, does NOT cover the capture
-        source by default, and is the recommended mode for gameplay."""
         if self.live_challenge_window is not None:
             try:
                 if self.live_challenge_window.winfo_exists():
@@ -635,7 +772,6 @@ class APVDApp:
         w.title("APVD Real-Time Dreamify - Challenge Window")
         w.attributes("-topmost", True)
         w.resizable(True, True)
-        # Place to the right of main window so it does not cover it by default
         try:
             self.root.update_idletasks()
             rx = self.root.winfo_x() + self.root.winfo_width() + 12
@@ -645,7 +781,6 @@ class APVDApp:
             w.geometry("960x540")
         w.configure(bg="black")
 
-        # Status strip at the top
         tip = ttk.Label(
             w,
             text="Challenge Window — position this outside your capture region to avoid feedback. Esc stops.",
@@ -680,10 +815,6 @@ class APVDApp:
         self._live_challenge_photo = None
 
     def _display_challenge_frame(self, pil_img: Image.Image):
-        """Render a dreamified frame into the Challenge Window.
-        Called on the main thread via _after(0, ...) from the worker.
-        Preserves aspect ratio of the source image within the canvas.
-        """
         from PIL import ImageTk
         if self._closing:
             return
@@ -699,13 +830,11 @@ class APVDApp:
                 return
             cw = max(1, canvas.winfo_width())
             ch = max(1, canvas.winfo_height())
-            # Fit image inside canvas preserving aspect ratio
             img = pil_img.convert("RGB")
             iw, ih = img.size
             scale = min(cw / max(1, iw), ch / max(1, ih))
             nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
             fitted = img.resize((nw, nh), Image.Resampling.BILINEAR)
-            # Letterbox onto black background
             bg = Image.new("RGB", (cw, ch), (0, 0, 0))
             bg.paste(fitted, ((cw - nw) // 2, (ch - nh) // 2))
             self._live_challenge_photo = ImageTk.PhotoImage(bg, master=win)
@@ -717,10 +846,6 @@ class APVDApp:
             self._live_challenge_photo = None
 
     def _prompt_capture_region(self) -> dict | None:
-        """Ask the user to enter a capture region (x, y, w, h).
-        Returns a dict suitable for mss.grab(), or None if cancelled.
-        Also warns if the region might overlap the Challenge Window.
-        """
         dialog = tk.Toplevel(self.root)
         dialog.title("Set Capture Region")
         dialog.resizable(False, False)
@@ -728,9 +853,7 @@ class APVDApp:
         dialog.grab_set()
         dialog.configure(bg=self._theme_palette["bg"])
         try:
-            dialog.geometry(
-                f"+{self.root.winfo_x() + 40}+{self.root.winfo_y() + 40}"
-            )
+            dialog.geometry(f"+{self.root.winfo_x() + 40}+{self.root.winfo_y() + 40}")
         except tk.TclError:
             pass
 
@@ -740,20 +863,12 @@ class APVDApp:
 
         frame = ttk.Frame(dialog, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="Enter the screen region to capture:").grid(
-            row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 8)
-        )
+        ttk.Label(frame, text="Enter the screen region to capture:").grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 8))
         fields = {}
         defaults = {"X": 0, "Y": 0, "Width": sw, "Height": sh}
-        # Pre-fill with previous region if available
         if self._live_region is not None:
             prev = self._live_region
-            defaults = {
-                "X": prev.get("left", 0),
-                "Y": prev.get("top", 0),
-                "Width": prev.get("width", sw),
-                "Height": prev.get("height", sh),
-            }
+            defaults = {"X": prev.get("left", 0), "Y": prev.get("top", 0), "Width": prev.get("width", sw), "Height": prev.get("height", sh)}
         for col, (label, default) in enumerate(defaults.items()):
             ttk.Label(frame, text=label).grid(row=1, column=col * 2, sticky=tk.E, padx=(0, 4))
             var = tk.StringVar(value=str(default))
@@ -761,9 +876,7 @@ class APVDApp:
             fields[label] = var
 
         warn_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=warn_var, foreground="orange").grid(
-            row=2, column=0, columnspan=4, sticky=tk.W, pady=(6, 0)
-        )
+        ttk.Label(frame, textvariable=warn_var, foreground="orange").grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
 
         def _ok():
             nonlocal result
@@ -776,21 +889,15 @@ class APVDApp:
                 warn_var.set("Please enter valid integers for all fields.")
                 return
             region = {"left": x, "top": y, "width": w, "height": h}
-            # Warn if Challenge Window might overlap
             cwin = self.live_challenge_window
             if cwin is not None:
                 try:
                     if cwin.winfo_exists():
                         cx, cy = cwin.winfo_x(), cwin.winfo_y()
                         cw2, ch2 = cwin.winfo_width(), cwin.winfo_height()
-                        overlap = not (
-                            cx + cw2 <= x or cx >= x + w or
-                            cy + ch2 <= y or cy >= y + h
-                        )
+                        overlap = not (cx + cw2 <= x or cx >= x + w or cy + ch2 <= y or cy >= y + h)
                         if overlap:
-                            warn_var.set(
-                                "Challenge Window overlaps capture region — move it to avoid feedback flicker."
-                            )
+                            warn_var.set("Challenge Window overlaps capture region — move it to avoid feedback flicker.")
                             return
                 except tk.TclError:
                     pass
@@ -807,8 +914,6 @@ class APVDApp:
         dialog.wait_window()
         return result
 
-    # ── Overlay (Experimental) ────────────────────────────────────────────────
-
     def _apply_live_overlay_clickthrough(self, enabled: bool):
         window = self.live_overlay_window
         if window is None:
@@ -821,7 +926,6 @@ class APVDApp:
         if system == "Windows":
             try:
                 import ctypes
-
                 window.update_idletasks()
                 hwnd = window.winfo_id()
                 user32 = ctypes.windll.user32
@@ -841,50 +945,29 @@ class APVDApp:
                 else:
                     style &= ~ws_ex_transparent
                 set_style(hwnd, gwl_exstyle, style)
-                user32.SetWindowPos(
-                    hwnd,
-                    -1,
-                    0,
-                    0,
-                    0,
-                    0,
-                    swp_nomove | swp_nosize | swp_nozorder | swp_framechanged,
-                )
+                user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, swp_nomove | swp_nosize | swp_nozorder | swp_framechanged)
             except Exception:
                 pass
         elif system == "Darwin":
-            # macOS: use the Tk built-in ignore-events attribute
             try:
                 if enabled:
                     window.attributes("-transparent", True)
-                    # Route events through the overlay to the windows below
                     window.tk.call("wm", "attributes", window, "-type", "splash")
                 else:
                     window.attributes("-transparent", False)
             except Exception:
                 pass
         else:
-            # Linux/X11: use the _NET_WM_STATE or type hint to make the window
-            # non-interactive. Setting the type to "splash" removes decorations
-            # and prevents the WM from giving it focus or routing pointer events.
             try:
                 if enabled:
                     window.tk.call("wm", "attributes", window, "-type", "splash")
-                    window.attributes("-alpha", window.attributes("-alpha"))  # refresh
+                    window.attributes("-alpha", window.attributes("-alpha"))
                 else:
                     window.tk.call("wm", "attributes", window, "-type", "normal")
             except Exception:
                 pass
 
     def _exclude_overlay_from_capture(self):
-        """Tell Windows DWM to exclude the overlay window from screen capture.
-
-        This means mss (which calls BitBlt / DWM) will see the real desktop
-        behind our overlay rather than our own rendered output, completely
-        eliminating the feedback-loop problem without any alpha toggling.
-        Has no effect on non-Windows platforms (Linux/macOS solve this
-        differently via the splash window type or compositor rules).
-        """
         if os.name != "nt":
             return
         win = self.live_overlay_window
@@ -903,7 +986,6 @@ class APVDApp:
             return False
         try:
             import ctypes
-
             return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000)
         except Exception:
             return False
@@ -916,32 +998,16 @@ class APVDApp:
 
         if mode == "Day":
             return {
-                "bg": "#eef2f7",
-                "surface": "#ffffff",
-                "surface_alt": "#f7f9fc",
-                "text": "#1c2430",
-                "muted": "#596579",
-                "accent": "#2d6cdf",
-                "accent_text": "#ffffff",
-                "border": "#cfd8e6",
-                "canvas": "#e7edf6",
-                "canvas_border": "#9baac0",
-                "list_bg": "#ffffff",
-                "entry": "#ffffff",
+                "bg": "#eef2f7", "surface": "#ffffff", "surface_alt": "#f7f9fc",
+                "text": "#1c2430", "muted": "#596579", "accent": "#2d6cdf",
+                "accent_text": "#ffffff", "border": "#cfd8e6", "canvas": "#e7edf6",
+                "canvas_border": "#9baac0", "list_bg": "#ffffff", "entry": "#ffffff",
             }
         return {
-            "bg": "#121421",
-            "surface": "#1c2033",
-            "surface_alt": "#252a43",
-            "text": "#edf1ff",
-            "muted": "#aab3cf",
-            "accent": "#8b7cf6",
-            "accent_text": "#ffffff",
-            "border": "#3b4266",
-            "canvas": "#101323",
-            "canvas_border": "#59608a",
-            "list_bg": "#171b2d",
-            "entry": "#20253a",
+            "bg": "#121421", "surface": "#1c2033", "surface_alt": "#252a43",
+            "text": "#edf1ff", "muted": "#aab3cf", "accent": "#8b7cf6",
+            "accent_text": "#ffffff", "border": "#3b4266", "canvas": "#101323",
+            "canvas_border": "#59608a", "list_bg": "#171b2d", "entry": "#20253a",
         }
 
     def _configure_styles(self) -> None:
@@ -965,11 +1031,7 @@ class APVDApp:
         style.configure("TLabelframe", background=palette["surface"], bordercolor=palette["border"], relief="solid")
         style.configure("TLabelframe.Label", background=palette["surface"], foreground=palette["text"], font=("", 10, "bold"))
         style.configure("TButton", background=palette["surface_alt"], foreground=palette["text"], bordercolor=palette["border"], focusthickness=0, padding=(10, 6))
-        style.map(
-            "TButton",
-            background=[("active", palette["accent"]), ("pressed", palette["accent"])],
-            foreground=[("active", palette["accent_text"]), ("pressed", palette["accent_text"])],
-        )
+        style.map("TButton", background=[("active", palette["accent"]), ("pressed", palette["accent"])], foreground=[("active", palette["accent_text"]), ("pressed", palette["accent_text"])])
         style.configure("Accent.TButton", background=palette["accent"], foreground=palette["accent_text"], bordercolor=palette["accent"])
         style.map("Accent.TButton", background=[("active", palette["accent"]), ("pressed", palette["accent"])])
         style.configure("TCheckbutton", background=palette["surface"], foreground=palette["text"])
@@ -994,29 +1056,11 @@ class APVDApp:
                 elif role == "output_canvas":
                     widget.configure(bg=palette["canvas"])
                 elif role == "listbox":
-                    widget.configure(
-                        bg=palette["list_bg"],
-                        fg=palette["text"],
-                        selectbackground=palette["accent"],
-                        selectforeground=palette["accent_text"],
-                        highlightbackground=palette["border"],
-                    )
+                    widget.configure(bg=palette["list_bg"], fg=palette["text"], selectbackground=palette["accent"], selectforeground=palette["accent_text"], highlightbackground=palette["border"])
                 elif role == "scale":
-                    widget.configure(
-                        bg=palette["surface"],
-                        fg=palette["text"],
-                        troughcolor=palette["surface_alt"],
-                        highlightthickness=0,
-                        activebackground=palette["accent"],
-                    )
+                    widget.configure(bg=palette["surface"], fg=palette["text"], troughcolor=palette["surface_alt"], highlightthickness=0, activebackground=palette["accent"])
                 elif role == "spinbox":
-                    widget.configure(
-                        bg=palette["entry"],
-                        fg=palette["text"],
-                        buttonbackground=palette["surface_alt"],
-                        insertbackground=palette["text"],
-                        highlightbackground=palette["border"],
-                    )
+                    widget.configure(bg=palette["entry"], fg=palette["text"], buttonbackground=palette["surface_alt"], insertbackground=palette["text"], highlightbackground=palette["border"])
             except tk.TclError:
                 continue
 
@@ -1036,13 +1080,7 @@ class APVDApp:
                 pass
 
     def _category_label(self, parent: tk.Widget, text: str, row: int) -> None:
-        ttk.Label(parent, text=text, style="Category.TLabel").grid(
-            row=row,
-            column=0,
-            columnspan=6,
-            sticky=tk.W,
-            pady=(10, 4),
-        )
+        ttk.Label(parent, text=text, style="Category.TLabel").grid(row=row, column=0, columnspan=6, sticky=tk.W, pady=(10, 4))
 
     @staticmethod
     def _device_choice_from_device(device: torch.device) -> str:
@@ -1079,15 +1117,127 @@ class APVDApp:
                 return "CUDA was not found on this computer."
             index = torch.cuda.current_device()
             props = torch.cuda.get_device_properties(index)
-            return (
-                f"CUDA GPU: {torch.cuda.get_device_name(index)} | "
-                f"VRAM: {self._format_gb(props.total_memory)} | "
-                f"GPU {index + 1}/{torch.cuda.device_count()}"
-            )
+            return f"CUDA GPU: {torch.cuda.get_device_name(index)} | VRAM: {self._format_gb(props.total_memory)} | GPU {index + 1}/{torch.cuda.device_count()}"
         if choice == "MPS":
             return "Apple Metal GPU acceleration is available."
         cpu_name = platform.processor() or platform.machine() or "CPU"
         return f"CPU: {cpu_name}"
+
+    def _cuda_compute_capability(self) -> tuple[int, int]:
+        if not torch.cuda.is_available():
+            return (0, 0)
+        try:
+            major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+            return int(major), int(minor)
+        except Exception:
+            return (0, 0)
+
+    def _cuda_gpu_name_lower(self) -> str:
+        if not torch.cuda.is_available():
+            return ""
+        try:
+            return str(torch.cuda.get_device_name(torch.cuda.current_device())).lower()
+        except Exception:
+            return ""
+
+    def _bf16_supported(self) -> bool:
+        if getattr(self.device, "type", "") != "cuda" or not torch.cuda.is_available():
+            return False
+        try:
+            return bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            major, _minor = self._cuda_compute_capability()
+            return major >= 8
+
+    def _resolve_auto_precision_mode(self) -> str:
+        """Choose a safe default for unknown consumer hardware. Users can override this."""
+        if getattr(self.device, "type", "") != "cuda" or not torch.cuda.is_available():
+            return "FP32 Stable"
+        name = self._cuda_gpu_name_lower()
+        major, _minor = self._cuda_compute_capability()
+        if self._bf16_supported():
+            return "BF16 Balanced"
+        # Older CUDA cards and many laptop/mobile GPUs are more likely to be cranky
+        # with FP16, so Auto chooses stability there. Dedicated RTX desktop GPUs can
+        # still pick FP16 Fast manually if desired.
+        if major < 7 or any(word in name for word in ("laptop", "mobile", "mx", "quadro m", "gtx 9", "gtx 10")):
+            return "FP32 Stable"
+        return "FP16 Fast"
+
+    def _resolve_precision_settings(self) -> dict[str, object]:
+        requested = self.precision_mode_var.get() if hasattr(self, "precision_mode_var") else "Auto Recommended"
+        if requested not in PRECISION_MODE_CHOICES:
+            requested = "Auto Recommended"
+        resolved = self._resolve_auto_precision_mode() if requested == "Auto Recommended" else requested
+        device_type = getattr(self.device, "type", "")
+        if device_type != "cuda":
+            resolved = "FP32 Stable"
+
+        autocast_enabled = False
+        autocast_dtype = None
+        scaler_enabled = False
+        if device_type == "cuda" and resolved == "FP16 Fast":
+            autocast_enabled = True
+            autocast_dtype = torch.float16
+            scaler_enabled = True
+        elif device_type == "cuda" and resolved == "BF16 Balanced":
+            if self._bf16_supported():
+                autocast_enabled = True
+                autocast_dtype = torch.bfloat16
+                scaler_enabled = False
+            else:
+                resolved = "FP32 Stable"
+
+        self.mixed_precision_var.set(bool(autocast_enabled))
+        dtype_label = "fp32"
+        if autocast_dtype is torch.float16:
+            dtype_label = "fp16"
+        elif autocast_dtype is torch.bfloat16:
+            dtype_label = "bf16"
+        return {
+            "requested": requested,
+            "resolved": resolved,
+            "autocast_enabled": autocast_enabled,
+            "autocast_dtype": autocast_dtype,
+            "scaler_enabled": scaler_enabled,
+            "non_blocking": device_type == "cuda",
+            "dtype_label": dtype_label,
+        }
+
+    def _on_precision_mode_changed(self, *_args) -> None:
+        settings = self._resolve_precision_settings()
+        if hasattr(self, "status_var"):
+            requested = str(settings["requested"])
+            resolved = str(settings["resolved"])
+            if requested == "Auto Recommended":
+                self.status_var.set(f"Precision Mode: Auto Recommended → {resolved}.")
+            else:
+                self.status_var.set(f"Precision Mode: {resolved}.")
+
+    def _cache_items_per_worker(self, requested_total: int, loader_workers: int) -> int:
+        """Return a per-worker cache budget so the UI value acts like an approximate total RAM budget."""
+        requested_total = max(0, int(requested_total))
+        loader_workers = max(0, int(loader_workers))
+        if requested_total <= 0:
+            return 0
+        if loader_workers <= 0:
+            return requested_total
+        return max(1, requested_total // loader_workers)
+
+    def _build_training_dataloader(self, dataset: Dataset, *, batch_size: int, loader_workers: int, prefetch_batches: int, shuffle: bool = True) -> DataLoader:
+        cuda_enabled = getattr(self.device, "type", "") == "cuda"
+        loader_kwargs = {"batch_size": batch_size, "shuffle": shuffle, "num_workers": loader_workers, "pin_memory": cuda_enabled}
+        if loader_workers > 0:
+            loader_kwargs.update({"persistent_workers": True, "prefetch_factor": prefetch_batches})
+        logger.info(
+            "Building DataLoader: samples=%s batch=%s workers=%s prefetch=%s cache_per_worker=%s",
+            len(dataset),
+            batch_size,
+            loader_workers,
+            prefetch_batches if loader_workers > 0 else 0,
+            getattr(dataset, "cache_limit", 0),
+        )
+        return DataLoader(dataset, **loader_kwargs)
 
     @staticmethod
     def _training_intensity_percent(choice: str) -> int:
@@ -1109,12 +1259,7 @@ class APVDApp:
             workers, prefetch, throttle_cap = max(1, min(max_workers, 2)), 1, 1.25
         else:
             workers, prefetch, throttle_cap = 1, 1, 1.75
-        return {
-            "percent": percent,
-            "workers": workers,
-            "prefetch": prefetch,
-            "throttle_cap": throttle_cap,
-        }
+        return {"percent": percent, "workers": workers, "prefetch": prefetch, "throttle_cap": throttle_cap}
 
     def _apply_training_intensity(self, *_args) -> None:
         profile = self._training_intensity_profile()
@@ -1125,9 +1270,7 @@ class APVDApp:
             if percent >= 100:
                 self.status_var.set("Training intensity set to 100%: maximum data loading with no throttling.")
             else:
-                self.status_var.set(
-                    f"Training intensity set to {percent}%: data loading tuned down and GPU work throttled between batches."
-                )
+                self.status_var.set(f"Training intensity set to {percent}%: data loading tuned down and GPU work throttled between batches.")
 
     def _refresh_hardware_status(self) -> None:
         choice = self._device_choice_from_device(self.device)
@@ -1137,27 +1280,73 @@ class APVDApp:
         self.hardware_status_var.set(status)
         self.header_device_var.set(status)
 
+    def _optimize_for_gpu(self) -> None:
+        if self.is_training or self.is_latent_diffusion_training or self.realtime_dreamify_active:
+            messagebox.showwarning("Hardware", "Stop training and Real-Time Dreamify before optimizing settings.")
+            return
+        if getattr(self.device, "type", "") == "cuda" and torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            vram_gb = props.total_memory / (1024 ** 3)
+            self.precision_mode_var.set("Auto Recommended")
+            self._resolve_precision_settings()
+            self.nan_guard_var.set(True)
+            self.training_intensity_var.set("75% Fast")
+            if vram_gb >= 11:
+                self.resolution_var.set(384)
+                self.batch_size_var.set(32)
+                self.loader_workers_var.set(6)
+                self.prefetch_batches_var.set(4)
+                self.live_resolution_var.set("256")
+                self.diffusion_steps_var.set(10)
+                self.diffusion_strength_var.set(0.85)
+                self.memory_training_limit_var.set(max(int(self.memory_training_limit_var.get()), 64))
+                note = "RTX 3060 / 12GB-style preset applied: 384px, batch 32, Auto precision, stronger prefetch."
+            elif vram_gb >= 7:
+                self.resolution_var.set(320)
+                self.batch_size_var.set(24)
+                self.loader_workers_var.set(4)
+                self.prefetch_batches_var.set(3)
+                self.live_resolution_var.set("192")
+                note = "Mid-VRAM CUDA preset applied."
+            else:
+                self.resolution_var.set(256)
+                self.batch_size_var.set(16)
+                self.loader_workers_var.set(3)
+                self.prefetch_batches_var.set(2)
+                self.live_resolution_var.set("192")
+                note = "Low-VRAM CUDA preset applied."
+            self.status_var.set(note)
+            messagebox.showinfo("Optimize For My GPU", note)
+            return
+        self.precision_mode_var.set("FP32 Stable")
+        self._resolve_precision_settings()
+        self.nan_guard_var.set(True)
+        self.resolution_var.set(256)
+        self.batch_size_var.set(8)
+        self.loader_workers_var.set(2)
+        self.prefetch_batches_var.set(1)
+        self.status_var.set("CPU-safe preset applied: 256px, batch 8, FP32 Stable.")
+
     def _change_device(self, *_args) -> None:
         if self.is_training or self.is_latent_diffusion_training or self.realtime_dreamify_active:
             messagebox.showwarning("Hardware", "Stop training and Real-Time Dreamify before switching hardware.")
             self._refresh_hardware_status()
             return
-
         choice = self.device_choice_var.get()
         if choice not in self._available_device_choices():
             messagebox.showerror("Hardware", f"{choice} is not available on this computer.")
             self._refresh_hardware_status()
             return
-
         new_device = self._device_from_choice(choice)
         try:
-            if self.model is not None:
-                self.model = self.model.to(new_device)
-            if self.latent_diffusion is not None:
-                self.latent_diffusion = self.latent_diffusion.to(new_device)
-            if getattr(self.device, "type", "") == "cuda" and new_device.type != "cuda":
-                torch.cuda.empty_cache()
-            self.device = new_device
+            with self.model_lock:
+                if self.model is not None:
+                    self.model = self.model.to(new_device)
+                if self.latent_diffusion is not None:
+                    self.latent_diffusion = self.latent_diffusion.to(new_device)
+                if getattr(self.device, "type", "") == "cuda" and new_device.type != "cuda":
+                    torch.cuda.empty_cache()
+                self.device = new_device
             self._refresh_hardware_status()
             if hasattr(self, "status_var"):
                 self.status_var.set(f"Hardware switched to {choice}.")
@@ -1168,21 +1357,11 @@ class APVDApp:
     def _open_manual(self) -> None:
         w = tk.Toplevel(self.root)
         w.title("APVD Manual")
-        w.geometry("760x620")
+        w.geometry("760x680")
         w.minsize(620, 480)
         outer = ttk.Frame(w, padding=12)
         outer.pack(fill=tk.BOTH, expand=True)
-        text = tk.Text(
-            outer,
-            wrap=tk.WORD,
-            bg=self._theme_palette["list_bg"],
-            fg=self._theme_palette["text"],
-            insertbackground=self._theme_palette["text"],
-            relief=tk.FLAT,
-            padx=12,
-            pady=12,
-            height=24,
-        )
+        text = tk.Text(outer, wrap=tk.WORD, bg=self._theme_palette["list_bg"], fg=self._theme_palette["text"], insertbackground=self._theme_palette["text"], relief=tk.FLAT, padx=12, pady=12, height=24)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=text.yview)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1192,6 +1371,46 @@ class APVDApp:
 
     def _manual_text(self) -> str:
         return """APVD Quick Manual
+
+========================
+ RECONSTRUCTION MODE
+========================
+
+RGB VAE
+- Classic APVD mode.
+- Trains directly on RGB pixels.
+- Best compatibility with old APVD models.
+
+Wavelet
+- Experimental mode.
+- Trains on a multi-frequency image representation.
+- May preserve structure and edges better.
+- May train slightly slower and creates models that are not compatible with RGB VAE checkpoints.
+
+
+========================
+ PRECISION MODE
+========================
+
+Auto Recommended
+- Default consumer-friendly mode.
+- Chooses a stable precision for the selected hardware.
+
+FP32 Stable
+- Safest math mode.
+- Best for laptop GPUs, older CUDA cards, CPU training, unstable drivers, and NaN/crash problems.
+- Slower, but reliable.
+
+FP16 Fast
+- Fast CUDA mixed precision.
+- Best for GPUs that handle FP16 well.
+- If training becomes unstable, switch back to FP32 Stable.
+
+BF16 Balanced
+- Uses bfloat16 autocast on supported CUDA GPUs.
+- Often more stable than FP16 while still faster than full FP32.
+- Falls back to FP32 Stable if unsupported.
+
 
 ========================
  APVD MODEL GUIDE
@@ -1262,9 +1481,13 @@ Batch Loads
 Prefetch Batches
 - Prepared batches kept ahead for smoother GPU usage.
 
+Dataset Cache
+- Approximate number of decoded/resized training images to keep warm in RAM.
+- The cache budget is split across loader workers so high worker counts do not multiply RAM use unexpectedly.
+- Higher values reduce repeated image decoding on later epochs but use more RAM.
+
 Training Intensity
 - Chooses how aggressively training uses CPU data loading and GPU time.
-- 10% is best while using the computer; 100% removes throttling and maximizes the feeder.
 
 Memory Images
 - Saved memories mixed into training.
@@ -1298,15 +1521,19 @@ Dream Cycle
 - Morphs between latent memories.
 
 Dreamify Image/Video
-- Reconstructs an uploaded image or video through the loaded APVD model memory, creating an input-guided dream reconstruction instead of random generation.
+- Reconstructs an uploaded image or video through the loaded APVD model memory.
 
 Real-Time Dreamify
-- Captures the screen live and reconstructs it through the loaded APVD model memory, creating a real-time AI dream filter preview for OBS or gameplay experiments.
-- For gameplay, use Challenge Window mode with the game in Borderless Windowed or Windowed mode. Set Capture Mode to Region and position the Challenge Window outside the captured area.
-- Experimental Fullscreen Overlay may flicker or show black frames because some games and screen capture APIs do not allow reliable click-through overlays. Esc stops the live filter in overlay mode.
+- Captures the screen live and reconstructs it through the loaded APVD model memory.
 
 Dream Continuation Video
-- Generates a short APVD dream video by smoothly walking through the loaded model's latent space and exporting the decoded frames as an MP4.
+- Generates a short APVD dream video by smoothly walking through the loaded model's latent space.
+
+Autoregressive Feedback
+- Feeds each generated dream frame back through APVD's encoder so the next frame continues from what the model actually drew.
+
+Feedback Strength
+- Controls how strongly generated frames steer the next dream frame. Higher values make it more self-feeding but can drift or melt faster.
 
 Blend Trained Images
 - Mixes learned image anchors.
@@ -1433,15 +1660,7 @@ Hardware Status
         return body
 
     @staticmethod
-    def _grid_row(
-        parent: tk.Widget,
-        row: int,
-        label: str,
-        widget: tk.Widget,
-        *,
-        column: int = 0,
-        pad_y: int = 4,
-    ) -> None:
+    def _grid_row(parent: tk.Widget, row: int, label: str, widget: tk.Widget, *, column: int = 0, pad_y: int = 4) -> None:
         ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=column, sticky=tk.W, padx=(0, 8), pady=pad_y)
         widget.grid(row=row, column=column + 1, sticky=tk.W, padx=(0, 18), pady=pad_y)
 
@@ -1477,13 +1696,7 @@ Hardware Status
         ttk.Label(header, textvariable=self.header_device_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=(14, 0))
         ttk.Button(header, text="Manual", command=self._open_manual).pack(side=tk.RIGHT, padx=(12, 0))
         ttk.Label(header, text="Theme:").pack(side=tk.RIGHT, padx=(12, 6))
-        theme_box = ttk.Combobox(
-            header,
-            textvariable=self.theme_mode_var,
-            values=("Auto", "Day", "Night"),
-            state="readonly",
-            width=8,
-        )
+        theme_box = ttk.Combobox(header, textvariable=self.theme_mode_var, values=("Auto", "Day", "Night"), state="readonly", width=8)
         theme_box.pack(side=tk.RIGHT)
         theme_box.bind("<<ComboboxSelected>>", self._set_theme)
         self._refresh_hardware_status()
@@ -1491,60 +1704,39 @@ Hardware Status
         hardware_frame = self._make_section(content, "Hardware", open_by_default=True)
         self._category_label(hardware_frame, "Compute Device", 0)
         ttk.Label(hardware_frame, text="Run On:", style="Surface.TLabel").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=4)
-        hardware_box = ttk.Combobox(
-            hardware_frame,
-            textvariable=self.device_choice_var,
-            values=self._available_device_choices(),
-            state="readonly",
-            width=10,
-        )
+        hardware_box = ttk.Combobox(hardware_frame, textvariable=self.device_choice_var, values=self._available_device_choices(), state="readonly", width=10)
         hardware_box.grid(row=1, column=1, sticky=tk.W, padx=(0, 12), pady=4)
         hardware_box.bind("<<ComboboxSelected>>", self._change_device)
-        ttk.Button(hardware_frame, text="Refresh Hardware", command=self._refresh_hardware_status).grid(
-            row=1,
-            column=2,
-            sticky=tk.W,
-            padx=4,
-            pady=4,
-        )
-        ttk.Label(hardware_frame, textvariable=self.hardware_status_var, style="SurfaceMuted.TLabel").grid(
-            row=2,
-            column=0,
-            columnspan=5,
-            sticky=tk.W,
-            pady=(6, 0),
-        )
+        ttk.Button(hardware_frame, text="Refresh Hardware", command=self._refresh_hardware_status).grid(row=1, column=2, sticky=tk.W, padx=4, pady=4)
+        ttk.Button(hardware_frame, text="Optimize For My GPU", command=self._optimize_for_gpu, style="Accent.TButton").grid(row=1, column=3, sticky=tk.W, padx=4, pady=4)
+        ttk.Label(hardware_frame, textvariable=self.hardware_status_var, style="SurfaceMuted.TLabel").grid(row=2, column=0, columnspan=5, sticky=tk.W, pady=(6, 0))
 
         source_frame = self._make_section(content, "Sources And Model", open_by_default=True)
         self._category_label(source_frame, "Training Sources", 0)
         source_buttons = ttk.Frame(source_frame, style="Surface.TFrame")
         source_buttons.grid(row=1, column=0, sticky=tk.W)
-        for idx, (text, command) in enumerate(
-            [
-                ("Select Images", self._select_images),
-                ("Select Folder", self._select_folder),
-                ("Batch Folder", self._select_batch_folder),
-                ("Select Video(s)", self._select_videos),
-                ("Select Archive(s)", self._select_archives),
-                ("Clear Sources", self._clear_training_sources),
-            ]
-        ):
+        for idx, (text, command) in enumerate([
+            ("Select Images", self._select_images),
+            ("Select Folder", self._select_folder),
+            ("Batch Folder", self._select_batch_folder),
+            ("Select Video(s)", self._select_videos),
+            ("Select Archive(s)", self._select_archives),
+            ("Clear Sources", self._clear_training_sources),
+        ]):
             ttk.Button(source_buttons, text=text, command=command).grid(row=idx // 3, column=idx % 3, padx=4, pady=4, sticky=tk.W)
 
         model_buttons = ttk.Frame(source_frame, style="Surface.TFrame")
         self._category_label(source_frame, "Model Tools", 2)
         model_buttons.grid(row=3, column=0, sticky=tk.W, pady=(4, 0))
-        for idx, (text, command) in enumerate(
-            [
-                ("Save Model", self._save_model),
-                ("Load Model", self._load_model),
-                ("PyTorch Map", self._open_model_map),
-                ("Merge Models", self._merge_models),
-                ("Prompt Generation", self._auto_load_model),
-                ("Compose Scene", self._compose_scene_prompt),
-                ("Output Display", self._create_output_window),
-            ]
-        ):
+        for idx, (text, command) in enumerate([
+            ("Save Model", self._save_model),
+            ("Load Model", self._load_model),
+            ("PyTorch Map", self._open_model_map),
+            ("Merge Models", self._merge_models),
+            ("Prompt Generation", self._auto_load_model),
+            ("Compose Scene", self._compose_scene_prompt),
+            ("Output Display", self._create_output_window),
+        ]):
             ttk.Button(model_buttons, text=text, command=command).grid(row=idx // 4, column=idx % 4, padx=4, pady=4, sticky=tk.W)
 
         training_frame = self._make_section(content, "Training Settings", open_by_default=True)
@@ -1556,55 +1748,57 @@ Hardware Status
         self.stop_btn = ttk.Button(training_frame, text="Stop Training", command=self._stop_training, state=tk.DISABLED)
         self.stop_btn.grid(row=1, column=2, padx=6, pady=(0, 10), sticky=tk.W)
 
-        self._category_label(training_frame, "Model Learning", 2)
+        self._category_label(training_frame, "Reconstruction Mode", 2)
+        rec_mode_box = ttk.Combobox(training_frame, textvariable=self.reconstruction_mode_var, values=("RGB VAE", "Wavelet"), state="readonly", width=12)
+        rec_mode_box.grid(row=3, column=0, sticky=tk.W, padx=(0, 12), pady=4)
+        rec_mode_box.bind("<<ComboboxSelected>>", lambda e: self.status_var.set(f"Reconstruction mode set to {self._get_reconstruction_mode()}."))
+        ttk.Label(training_frame, text="RGB VAE: classic APVD pixel reconstruction.\nWavelet: experimental multi-frequency reconstruction for better structure/detail.", style="SurfaceMuted.TLabel").grid(row=3, column=1, columnspan=3, sticky=tk.W, pady=4)
+
+        self._category_label(training_frame, "Model Learning", 4)
         self.epoch_spin = ttk.Spinbox(training_frame, from_=1, to=50000, increment=1, width=8, textvariable=self.epochs_var)
-        self._grid_row(training_frame, 3, "Epochs:", self.epoch_spin)
+        self._grid_row(training_frame, 5, "Epochs:", self.epoch_spin)
         self.resolution_spin = ttk.Spinbox(training_frame, from_=32, to=1024, increment=16, width=8, textvariable=self.resolution_var)
-        self._grid_row(training_frame, 3, "Resolution:", self.resolution_spin, column=2)
+        self._grid_row(training_frame, 5, "Resolution:", self.resolution_spin, column=2)
         self.batch_spin = ttk.Spinbox(training_frame, from_=1, to=256, increment=1, width=8, textvariable=self.batch_size_var)
-        self._grid_row(training_frame, 4, "Batch Size:", self.batch_spin)
+        self._grid_row(training_frame, 6, "Batch Size:", self.batch_spin)
         self.lr_spin = ttk.Spinbox(training_frame, from_=0.000001, to=0.1, increment=0.00001, width=10, textvariable=self.learning_rate_var, format="%.6f")
-        self._grid_row(training_frame, 4, "Learning Rate:", self.lr_spin, column=2)
-        self._category_label(training_frame, "Data Loading", 5)
-        self.loader_spin = ttk.Spinbox(training_frame, from_=0, to=16, increment=1, width=8, textvariable=self.loader_workers_var)
-        self._grid_row(training_frame, 6, "Batch Loads:", self.loader_spin)
-        self.prefetch_spin = ttk.Spinbox(training_frame, from_=1, to=16, increment=1, width=8, textvariable=self.prefetch_batches_var)
-        self._grid_row(training_frame, 6, "Prefetch Batches:", self.prefetch_spin, column=2)
-        self.intensity_box = ttk.Combobox(
-            training_frame,
-            textvariable=self.training_intensity_var,
-            values=TRAINING_INTENSITY_CHOICES,
-            state="readonly",
-            width=18,
-        )
+        self._grid_row(training_frame, 6, "Learning Rate:", self.lr_spin, column=2)
+        precision_box = ttk.Combobox(training_frame, textvariable=self.precision_mode_var, values=PRECISION_MODE_CHOICES, state="readonly", width=20)
+        self._grid_row(training_frame, 7, "Precision Mode:", precision_box)
+        precision_box.bind("<<ComboboxSelected>>", self._on_precision_mode_changed)
+        ttk.Label(training_frame, text="FP32 = safest. FP16 = fastest when stable. BF16 = supported-GPU balance.", style="SurfaceMuted.TLabel").grid(row=7, column=2, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(training_frame, text="NaN Guard / Auto-Recover", variable=self.nan_guard_var).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        self._category_label(training_frame, "Data Loading", 9)
+        self.loader_spin = ttk.Spinbox(training_frame, from_=0, to=32, increment=1, width=8, textvariable=self.loader_workers_var)
+        self._grid_row(training_frame, 10, "Batch Loads:", self.loader_spin)
+        self.prefetch_spin = ttk.Spinbox(training_frame, from_=1, to=512, increment=1, width=8, textvariable=self.prefetch_batches_var)
+        self._grid_row(training_frame, 10, "Prefetch Batches:", self.prefetch_spin, column=2)
+        cache_spin = ttk.Spinbox(training_frame, from_=0, to=200000, increment=512, width=8, textvariable=self.dataset_cache_items_var)
+        self._grid_row(training_frame, 11, "Dataset Cache:", cache_spin)
+        ttk.Label(training_frame, text="Approx. total decoded/resized images kept warm in RAM; split across workers.", style="SurfaceMuted.TLabel").grid(row=11, column=2, columnspan=3, sticky=tk.W, pady=4)
+        self.intensity_box = ttk.Combobox(training_frame, textvariable=self.training_intensity_var, values=TRAINING_INTENSITY_CHOICES, state="readonly", width=18)
         self.intensity_box.bind("<<ComboboxSelected>>", self._apply_training_intensity)
-        self._grid_row(training_frame, 7, "Training Intensity:", self.intensity_box)
-        ttk.Checkbutton(
-            training_frame,
-            text="Blend memory into training",
-            variable=self.include_memory_training_var,
-        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        self._grid_row(training_frame, 12, "Training Intensity:", self.intensity_box)
+        ttk.Checkbutton(training_frame, text="Blend memory into training", variable=self.include_memory_training_var).grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         memory_limit_spin = ttk.Spinbox(training_frame, from_=0, to=10000, increment=8, width=8, textvariable=self.memory_training_limit_var)
-        self._grid_row(training_frame, 8, "Memory Images:", memory_limit_spin, column=2, pad_y=8)
-        self._category_label(training_frame, "Video Sampling", 9)
+        self._grid_row(training_frame, 13, "Memory Images:", memory_limit_spin, column=2, pad_y=8)
+        self._category_label(training_frame, "Video Sampling", 14)
         video_stride_spin = ttk.Spinbox(training_frame, from_=1, to=10000, increment=1, width=8, textvariable=self.video_stride_var)
-        self._grid_row(training_frame, 10, "Video Stride:", video_stride_spin)
+        self._grid_row(training_frame, 15, "Video Stride:", video_stride_spin)
         max_frames_spin = ttk.Spinbox(training_frame, from_=0, to=1_000_000, increment=100, width=8, textvariable=self.video_max_frames_var)
-        self._grid_row(training_frame, 10, "Max Frames:", max_frames_spin, column=2)
+        self._grid_row(training_frame, 15, "Max Frames:", max_frames_spin, column=2)
 
         gen_tools_frame = self._make_section(content, "Generation Tools", open_by_default=True)
         self._category_label(gen_tools_frame, "Generate And Cycle", 0)
-        for idx, (text, command) in enumerate(
-            [
-                ("Generate Unique", self._generate),
-                ("Dreamify Image/Video", self._dreamify_media),
-                ("Real-Time Dreamify", self._toggle_realtime_dreamify),
-                ("Dream Continuation Video", self._generate_dream_continuation_video),
-                ("Reconstruction Video", self._export_reconstruction_video),
-                ("Chaos Mode", self._toggle_chaos),
-                ("Model Shuffle", self._toggle_model_cycle),
-            ]
-        ):
+        for idx, (text, command) in enumerate([
+            ("Generate Unique", self._generate),
+            ("Dreamify Image/Video", self._dreamify_media),
+            ("Real-Time Dreamify", self._toggle_realtime_dreamify),
+            ("Dream Continuation Video", self._generate_dream_continuation_video),
+            ("Reconstruction Video", self._export_reconstruction_video),
+            ("Chaos Mode", self._toggle_chaos),
+            ("Model Shuffle", self._toggle_model_cycle),
+        ]):
             ttk.Button(gen_tools_frame, text=text, command=command).grid(row=1, column=idx, padx=4, pady=4, sticky=tk.W)
         ttk.Checkbutton(gen_tools_frame, text="Auto-Cycle", variable=self.auto_cycle_var, command=self._toggle_auto_cycle).grid(row=2, column=0, padx=4, pady=8, sticky=tk.W)
         ttk.Checkbutton(gen_tools_frame, text="Dream Cycle (Morph)", variable=self.dream_cycle_var, command=self._toggle_dream_cycle).grid(row=2, column=1, padx=4, pady=8, sticky=tk.W)
@@ -1629,113 +1823,72 @@ Hardware Status
         ttk.Checkbutton(generation_settings, text="Use Mini Diffusion", variable=self.use_mini_diffusion_var).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(10, 4))
         diffusion_steps_spin = ttk.Spinbox(generation_settings, from_=1, to=50, increment=1, width=6, textvariable=self.diffusion_steps_var)
         self._grid_row(generation_settings, 8, "Diffusion Steps:", diffusion_steps_spin)
-        diffusion_strength_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.1, to=1.5, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.diffusion_strength_var),
-            "scale",
-        )
+        diffusion_strength_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.1, to=1.5, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.diffusion_strength_var), "scale")
         self._grid_row(generation_settings, 9, "Denoise Strength:", diffusion_strength_scale)
         self._category_label(generation_settings, "Dreamify", 10)
-        dream_strength_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.0, to=2.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.dream_strength_var),
-            "scale",
-        )
+        dream_strength_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=2.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.dream_strength_var), "scale")
         self._grid_row(generation_settings, 11, "Dream Strength:", dream_strength_scale)
-        memory_pull_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.memory_pull_var),
-            "scale",
-        )
+        memory_pull_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.memory_pull_var), "scale")
         self._grid_row(generation_settings, 12, "Memory Pull:", memory_pull_scale)
         dreamify_skip_spin = ttk.Spinbox(generation_settings, from_=1, to=30, increment=1, width=6, textvariable=self.dreamify_frame_skip_var)
         self._grid_row(generation_settings, 13, "Dreamify Frame Skip:", dreamify_skip_spin)
         ttk.Checkbutton(generation_settings, text="Keep Original Audio", variable=self.keep_original_audio_var).grid(row=13, column=2, sticky=tk.W, padx=(0, 18), pady=4)
         self._category_label(generation_settings, "Real-Time Dreamify", 14)
-        live_resolution_box = ttk.Combobox(
-            generation_settings,
-            textvariable=self.live_resolution_var,
-            values=("128", "192", "256"),
-            state="readonly",
-            width=6,
-        )
+        live_resolution_box = ttk.Combobox(generation_settings, textvariable=self.live_resolution_var, values=("128", "192", "256"), state="readonly", width=6)
         self._grid_row(generation_settings, 15, "Live Resolution:", live_resolution_box)
         live_fps_spin = ttk.Spinbox(generation_settings, from_=1, to=30, increment=1, width=6, textvariable=self.live_target_fps_var)
         self._grid_row(generation_settings, 15, "Target FPS:", live_fps_spin, column=2)
-        live_dream_strength_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.0, to=2.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.live_dream_strength_var),
-            "scale",
-        )
+        live_dream_strength_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=2.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.live_dream_strength_var), "scale")
         self._grid_row(generation_settings, 16, "Live Dream Strength:", live_dream_strength_scale)
-        live_memory_pull_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.live_memory_pull_var),
-            "scale",
-        )
+        live_memory_pull_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.live_memory_pull_var), "scale")
         self._grid_row(generation_settings, 17, "Live Memory Pull:", live_memory_pull_scale)
-        live_capture_box = ttk.Combobox(
-            generation_settings,
-            textvariable=self.live_capture_mode_var,
-            values=("Full Screen", "Region"),
-            state="readonly",
-            width=12,
-        )
+        live_capture_box = ttk.Combobox(generation_settings, textvariable=self.live_capture_mode_var, values=("Full Screen", "Region"), state="readonly", width=12)
         self._grid_row(generation_settings, 18, "Capture Mode:", live_capture_box)
         ttk.Checkbutton(generation_settings, text="Show Live FPS", variable=self.live_show_fps_var).grid(row=18, column=2, sticky=tk.W, padx=(0, 18), pady=4)
-        live_display_box = ttk.Combobox(
-            generation_settings,
-            textvariable=self.live_display_mode_var,
-            values=("Output Window", "Challenge Window", "Experimental Fullscreen Overlay"),
-            state="readonly",
-            width=18,
-        )
+        live_display_box = ttk.Combobox(generation_settings, textvariable=self.live_display_mode_var, values=("Output Window", "Challenge Window", "Experimental Fullscreen Overlay"), state="readonly", width=18)
         self._grid_row(generation_settings, 19, "Live Display:", live_display_box)
-        live_overlay_opacity_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.20, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.live_overlay_opacity_var),
-            "scale",
-        )
+        live_overlay_opacity_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.20, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.live_overlay_opacity_var), "scale")
         self._grid_row(generation_settings, 20, "Overlay Opacity:", live_overlay_opacity_scale)
         ttk.Checkbutton(generation_settings, text="Click-Through Overlay", variable=self.live_clickthrough_overlay_var).grid(row=20, column=2, sticky=tk.W, padx=(0, 18), pady=4)
         ttk.Checkbutton(generation_settings, text="Mini Diffusion Live", variable=self.live_mini_diffusion_var).grid(row=21, column=0, columnspan=2, sticky=tk.W, pady=(6, 4))
         self._category_label(generation_settings, "Dream Continuation Video", 22)
-        dream_video_seconds_spin = ttk.Spinbox(generation_settings, from_=1, to=30, increment=1, width=6, textvariable=self.dream_video_seconds_var)
+        dream_video_seconds_spin = ttk.Spinbox(generation_settings, from_=1, to=180, increment=1, width=6, textvariable=self.dream_video_seconds_var)
         self._grid_row(generation_settings, 23, "Dream Video Seconds:", dream_video_seconds_spin)
         dream_video_fps_spin = ttk.Spinbox(generation_settings, from_=4, to=30, increment=1, width=6, textvariable=self.dream_video_fps_var)
         self._grid_row(generation_settings, 23, "Dream Video FPS:", dream_video_fps_spin, column=2)
-        latent_drift_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.0, to=2.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.latent_drift_var),
-            "scale",
-        )
-        self._grid_row(generation_settings, 24, "Latent Drift:", latent_drift_scale)
-        motion_smoothness_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.0, to=0.99, resolution=0.01, orient=tk.HORIZONTAL, length=220, variable=self.motion_smoothness_var),
-            "scale",
-        )
-        self._grid_row(generation_settings, 25, "Motion Smoothness:", motion_smoothness_scale)
-        dream_instability_scale = self._register_theme_widget(
-            tk.Scale(generation_settings, from_=0.0, to=1.5, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.dream_instability_var),
-            "scale",
-        )
-        self._grid_row(generation_settings, 26, "Dream Instability:", dream_instability_scale)
+        dream_audio_box = ttk.Combobox(generation_settings, textvariable=self.dream_video_audio_mode_var, values=("Silent", "Use Source Video Audio", "Procedural Dream Audio"), state="readonly", width=20)
+        self._grid_row(generation_settings, 24, "Dream Audio:", dream_audio_box)
+        ttk.Button(generation_settings, text="Select Audio/Video", command=self._select_dream_audio_source).grid(row=24, column=2, sticky=tk.W, pady=4)
+        ttk.Button(generation_settings, text="Select Structure Video", command=self._select_dream_structure_video).grid(row=25, column=0, columnspan=2, sticky=tk.W, pady=4)
+        structure_guidance_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.dream_structure_guidance_var), "scale")
+        self._grid_row(generation_settings, 25, "Structure Guidance:", structure_guidance_scale, column=2)
+        latent_drift_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=2.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.latent_drift_var), "scale")
+        self._grid_row(generation_settings, 26, "Latent Drift:", latent_drift_scale)
+        motion_smoothness_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=0.99, resolution=0.01, orient=tk.HORIZONTAL, length=220, variable=self.motion_smoothness_var), "scale")
+        self._grid_row(generation_settings, 27, "Motion Smoothness:", motion_smoothness_scale)
+        dream_instability_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=1.5, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.dream_instability_var), "scale")
+        self._grid_row(generation_settings, 28, "Dream Instability:", dream_instability_scale)
+        ttk.Checkbutton(generation_settings, text="Autoregressive Feedback", variable=self.dream_autoregressive_var).grid(row=29, column=0, columnspan=2, sticky=tk.W, pady=(6, 4))
+        feedback_strength_scale = self._register_theme_widget(tk.Scale(generation_settings, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.dream_feedback_strength_var), "scale")
+        self._grid_row(generation_settings, 30, "Feedback Strength:", feedback_strength_scale)
 
         latent_diffusion_frame = self._make_section(content, "Latent DDPM Diffusion", open_by_default=False)
         self._category_label(latent_diffusion_frame, "DDPM Generation", 0)
         ttk.Checkbutton(latent_diffusion_frame, text="Use Latent DDPM on Generate", variable=self.use_latent_diffusion_var).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=4)
         latent_steps_spin = ttk.Spinbox(latent_diffusion_frame, from_=50, to=100, increment=5, width=6, textvariable=self.latent_diffusion_timesteps_var)
         self._grid_row(latent_diffusion_frame, 2, "Timesteps:", latent_steps_spin)
-        latent_strength_scale = self._register_theme_widget(
-            tk.Scale(latent_diffusion_frame, from_=0.05, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.latent_diffusion_strength_var),
-            "scale",
-        )
+        latent_strength_scale = self._register_theme_widget(tk.Scale(latent_diffusion_frame, from_=0.05, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=220, variable=self.latent_diffusion_strength_var), "scale")
         self._grid_row(latent_diffusion_frame, 3, "Polish Strength:", latent_strength_scale)
         self._category_label(latent_diffusion_frame, "DDPM Tools", 4)
         self.latent_diffusion_train_btn = ttk.Button(latent_diffusion_frame, text="Train DDPM", command=self._train_latent_diffusion)
-        for idx, button in enumerate(
-            [
-                self.latent_diffusion_train_btn,
-                ttk.Button(latent_diffusion_frame, text="Save DDPM", command=self._save_latent_diffusion),
-                ttk.Button(latent_diffusion_frame, text="Load DDPM", command=self._load_latent_diffusion),
-                ttk.Button(latent_diffusion_frame, text="APVD Recon", command=self._generate_apvd_reconstruction),
-                ttk.Button(latent_diffusion_frame, text="DDPM Polish", command=self._generate_latent_diffusion_polish),
-                ttk.Button(latent_diffusion_frame, text="Pure DDPM", command=self._generate_pure_latent_diffusion),
-            ]
-        ):
+        for idx, button in enumerate([
+            self.latent_diffusion_train_btn,
+            ttk.Button(latent_diffusion_frame, text="Save DDPM", command=self._save_latent_diffusion),
+            ttk.Button(latent_diffusion_frame, text="Load DDPM", command=self._load_latent_diffusion),
+            ttk.Button(latent_diffusion_frame, text="APVD Recon", command=self._generate_apvd_reconstruction),
+            ttk.Button(latent_diffusion_frame, text="DDPM Polish", command=self._generate_latent_diffusion_polish),
+            ttk.Button(latent_diffusion_frame, text="Pure DDPM", command=self._generate_pure_latent_diffusion),
+        ]):
             button.grid(row=5 + (idx // 3), column=idx % 3, padx=4, pady=(10 if idx < 3 else 4, 4), sticky=tk.W)
 
         prompt_frame = self._make_section(content, "Prompt And Personality", open_by_default=True)
@@ -1746,14 +1899,12 @@ Hardware Status
         ttk.Combobox(prompt_frame, textvariable=self.personality_var, values=list(PERSONALITY_PRESETS.keys()), state="readonly", width=14).grid(row=1, column=3, sticky=tk.W, padx=(8, 12))
         ttk.Button(prompt_frame, text="Apply Preset", command=self._apply_personality_preset).grid(row=1, column=4, sticky=tk.W)
         self._category_label(prompt_frame, "Seed And Memory Tools", 2)
-        for idx, (text, command) in enumerate(
-            [
-                ("Save Seed", self._save_current_seed),
-                ("Load Seed", self._load_seed),
-                ("Latent Map", self._open_latent_map),
-                ("Memory Retrain", self._evolve_from_memory),
-            ]
-        ):
+        for idx, (text, command) in enumerate([
+            ("Save Seed", self._save_current_seed),
+            ("Load Seed", self._load_seed),
+            ("Latent Map", self._open_latent_map),
+            ("Memory Retrain", self._evolve_from_memory),
+        ]):
             ttk.Button(prompt_frame, text=text, command=command).grid(row=3, column=idx, sticky=tk.W, pady=(10, 0), padx=(0 if idx == 0 else 8, 0))
         prompt_frame.columnconfigure(1, weight=1)
 
@@ -1766,17 +1917,16 @@ Hardware Status
         ttk.Label(evolution_frame, text="Use 1,3,4 format", style="SurfaceMuted.TLabel").grid(row=1, column=4, sticky=tk.W)
         ttk.Button(evolution_frame, text="Evolution Round", command=self._generate_evolution_round).grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
         ttk.Button(evolution_frame, text="Breed Favorites", command=self._breed_evolution_favorites).grid(row=2, column=1, sticky=tk.W, pady=(10, 0), padx=(8, 0))
+        ttk.Button(evolution_frame, text="Judge Generate", command=self._judge_generate_candidates).grid(row=2, column=2, sticky=tk.W, pady=(10, 0), padx=(8, 0))
+        ttk.Button(evolution_frame, text="Memory Finder", command=self._memory_finder_search).grid(row=2, column=3, sticky=tk.W, pady=(10, 0), padx=(8, 0))
         dream_fps_spin = ttk.Spinbox(evolution_frame, from_=1, to=60, increment=1, width=6, textvariable=self.dream_fps_var)
-        self._grid_row(evolution_frame, 2, "Dream FPS:", dream_fps_spin, column=2, pad_y=10)
+        self._grid_row(evolution_frame, 1, "Dream FPS:", dream_fps_spin, column=5, pad_y=4)
         self._category_label(evolution_frame, "Memory Stream", 3)
         self.memory_listbox = self._register_theme_widget(tk.Listbox(evolution_frame, height=6, exportselection=False), "listbox")
         self.memory_listbox.grid(row=4, column=0, columnspan=5, sticky=tk.EW, pady=(8, 0))
         ttk.Button(evolution_frame, text="Recall Memory", command=self._recall_selected_memory).grid(row=5, column=0, sticky=tk.W, pady=(8, 0))
         ttk.Button(evolution_frame, text="Use As Prompt Tag", command=self._use_memory_prompt).grid(row=5, column=1, sticky=tk.W, pady=(8, 0))
-        recent_bias_scale = self._register_theme_widget(
-            tk.Scale(evolution_frame, from_=0.1, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=160, variable=self.memory_recent_weight_var),
-            "scale",
-        )
+        recent_bias_scale = self._register_theme_widget(tk.Scale(evolution_frame, from_=0.1, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=160, variable=self.memory_recent_weight_var), "scale")
         self._grid_row(evolution_frame, 5, "Recent Bias:", recent_bias_scale, column=2, pad_y=8)
         evolution_frame.columnconfigure(0, weight=1)
 
@@ -1791,57 +1941,25 @@ Hardware Status
         preview_frame = self._make_section(content, "Preview", open_by_default=True)
         preview_tools = ttk.Frame(preview_frame, style="Surface.TFrame")
         preview_tools.pack(fill=tk.X, padx=10, pady=(10, 0))
-        self.training_preview_btn = ttk.Button(
-            preview_tools,
-            text="Display Image Progress",
-            command=self._toggle_training_progress_preview,
-        )
+        self.training_preview_btn = ttk.Button(preview_tools, text="Display Image Progress", command=self._toggle_training_progress_preview)
         self.training_preview_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.timelapse_btn = ttk.Button(
-            preview_tools,
-            text="Timelapse",
-            command=self._toggle_timelapse_recording,
-        )
+        self.timelapse_btn = ttk.Button(preview_tools, text="Timelapse", command=self._toggle_timelapse_recording)
         self.timelapse_btn.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(preview_tools, text="Training Video:", style="Surface.TLabel").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Radiobutton(
-            preview_tools,
-            text="Horizontal",
-            value="Horizontal",
-            variable=self.training_video_layout_var,
-        ).pack(side=tk.LEFT)
-        ttk.Radiobutton(
-            preview_tools,
-            text="Vertical 9:16",
-            value="Vertical",
-            variable=self.training_video_layout_var,
-        ).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Radiobutton(preview_tools, text="Horizontal", value="Horizontal", variable=self.training_video_layout_var).pack(side=tk.LEFT)
+        ttk.Radiobutton(preview_tools, text="Vertical 9:16", value="Vertical", variable=self.training_video_layout_var).pack(side=tk.LEFT, padx=(4, 0))
         self.canvas_frame = ttk.Frame(preview_frame, padding=10, style="Surface.TFrame")
         self.canvas_frame.pack(fill=tk.BOTH, expand=True)
-        self.canvas = self._register_theme_widget(
-            tk.Canvas(self.canvas_frame, width=512, height=512, bg=self._theme_palette["canvas"], highlightthickness=1, highlightbackground=self._theme_palette["canvas_border"]),
-            "canvas",
-        )
+        self.canvas = self._register_theme_widget(tk.Canvas(self.canvas_frame, width=512, height=512, bg=self._theme_palette["canvas"], highlightthickness=1, highlightbackground=self._theme_palette["canvas_border"]), "canvas")
         self.canvas.pack()
         self._apply_registered_theme()
 
     IMAGE_FILE_TYPES = [("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"), ("All files", "*.*")]
     FILE_TYPES = IMAGE_FILE_TYPES
-    VIDEO_FILE_TYPES = [
-        ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v *.wmv"),
-        ("All files", "*.*"),
-    ]
-    AUDIO_FILE_TYPES = [
-        ("Audio files", "*.mp3 *.wav *.m4a *.aac *.ogg *.flac"),
-        ("All files", "*.*"),
-    ]
+    VIDEO_FILE_TYPES = [("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v *.wmv"), ("All files", "*.*")]
+    AUDIO_FILE_TYPES = [("Audio files", "*.mp3 *.wav *.m4a *.aac *.ogg *.flac"), ("All files", "*.*")]
     MODEL_FILE_TYPES = [("PyTorch model", "*.pt"), ("PyTorch checkpoint", "*.pth"), ("All files", "*.*")]
-    ARCHIVE_FILE_TYPES = [
-        ("Archives", "*.zip *.tar *.tar.gz *.tgz"),
-        ("ZIP", "*.zip"),
-        ("TAR / compressed", "*.tar *.tar.gz *.tgz"),
-        ("All files", "*.*"),
-    ]
+    ARCHIVE_FILE_TYPES = [("Archives", "*.zip *.tar *.tar.gz *.tgz"), ("ZIP", "*.zip"), ("TAR / compressed", "*.tar *.tar.gz *.tgz"), ("All files", "*.*")]
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -1876,7 +1994,7 @@ Hardware Status
         self.timelapse_is_encoding = False
         self.timelapse_layout = self._current_training_video_layout()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = Path("Timelapses") / f"APVD_timelapse_{stamp}"
+        run_dir = TIMELAPSES_DIR / f"APVD_timelapse_{stamp}"
         frames_dir = run_dir / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
         self.timelapse_run_dir = run_dir
@@ -1919,30 +2037,19 @@ Hardware Status
             if first is None:
                 raise RuntimeError("No timelapse frames could be read.")
             height, width = first.shape[:2]
-            writer = cv2.VideoWriter(
-                str(video_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                TIMELAPSE_FPS,
-                (width, height),
-            )
+            writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), TIMELAPSE_FPS, (width, height))
             if not writer.isOpened():
                 raise RuntimeError("Could not open MP4 writer for timelapse export.")
             try:
                 for frame_path in frame_paths:
                     frame = cv2.imread(str(frame_path))
-                    if frame is None:
-                        continue
+                    if frame is None: continue
                     if frame.shape[:2] != (height, width):
                         frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
                     writer.write(frame)
             finally:
                 writer.release()
-            self._after(
-                0,
-                lambda p=video_path, n=len(frame_paths): self.status_var.set(
-                    f"Timelapse saved: {p} ({n} frames)."
-                ),
-            )
+            self._after(0, lambda p=video_path, n=len(frame_paths): self.status_var.set(f"Timelapse saved: {p} ({n} frames)."))
         except Exception as exc:
             self._after(0, lambda e=exc: messagebox.showerror("Timelapse", str(e)))
         finally:
@@ -1959,16 +2066,7 @@ Hardware Status
         return "Vertical" if self.training_video_layout_var.get() == "Vertical" else "Horizontal"
 
     @staticmethod
-    def _draw_training_progress_bar(
-        draw: ImageDraw.ImageDraw,
-        box: tuple[int, int, int, int],
-        progress: float,
-        *,
-        bg: tuple[int, int, int],
-        border: tuple[int, int, int],
-        accent: tuple[int, int, int],
-        muted: tuple[int, int, int],
-    ) -> None:
+    def _draw_training_progress_bar(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], progress: float, *, bg: tuple[int, int, int], border: tuple[int, int, int], accent: tuple[int, int, int], muted: tuple[int, int, int]) -> None:
         x0, y0, x1, y1 = box
         progress = min(100.0, max(0.0, progress))
         draw.rectangle((x0, y0, x1, y1), outline=border, fill=bg)
@@ -1976,13 +2074,7 @@ Hardware Status
         draw.rectangle((x0, y0, x0 + fill_w, y1), fill=accent)
         draw.text((x0, y1 + 8), f"{progress:.1f}% complete", fill=muted)
 
-    def _training_visual_frame(
-        self,
-        input_tensor: torch.Tensor,
-        recon_tensor: torch.Tensor,
-        metrics: dict,
-        layout: str | None = None,
-    ) -> Image.Image:
+    def _training_visual_frame(self, input_tensor: torch.Tensor, recon_tensor: torch.Tensor, metrics: dict, layout: str | None = None) -> Image.Image:
         palette = dict(self._theme_palette)
         bg = self._hex_to_rgb(palette["bg"])
         surface = self._hex_to_rgb(palette["surface"])
@@ -2012,15 +2104,7 @@ Hardware Status
             draw.rectangle((0, 0, 720, 116), fill=surface)
             draw.rectangle((0, 114, 720, 116), fill=accent)
             draw.text((34, 22), "APVD Training Progress", fill=text)
-            self._draw_training_progress_bar(
-                draw,
-                (34, 66, 686, 82),
-                progress,
-                bg=bg,
-                border=border,
-                accent=accent,
-                muted=muted,
-            )
+            self._draw_training_progress_bar(draw, (34, 66, 686, 82), progress, bg=bg, border=border, accent=accent, muted=muted)
 
             image_size = 252
             input_img = tensor_to_pil(input_tensor.detach().cpu()).resize((image_size, image_size), Image.Resampling.LANCZOS)
@@ -2043,15 +2127,7 @@ Hardware Status
             draw.rectangle((0, 0, 1280, 78), fill=surface)
             draw.rectangle((0, 76, 1280, 78), fill=accent)
             draw.text((34, 22), "APVD Training Progress", fill=text)
-            self._draw_training_progress_bar(
-                draw,
-                (890, 30, 1220, 44),
-                progress,
-                bg=bg,
-                border=border,
-                accent=accent,
-                muted=muted,
-            )
+            self._draw_training_progress_bar(draw, (890, 30, 1220, 44), progress, bg=bg, border=border, accent=accent, muted=muted)
 
             input_img = tensor_to_pil(input_tensor.detach().cpu()).resize((300, 300), Image.Resampling.LANCZOS)
             recon_img = tensor_to_pil(recon_tensor.detach().cpu()).resize((300, 300), Image.Resampling.LANCZOS)
@@ -2071,14 +2147,7 @@ Hardware Status
                 draw.text((x, line_y), line, fill=text if idx < 4 else muted)
         return canvas
 
-    def _handle_training_visual_snapshot(
-        self,
-        batch: torch.Tensor,
-        recon: torch.Tensor,
-        metrics: dict,
-        *,
-        force: bool = False,
-    ) -> None:
+    def _handle_training_visual_snapshot(self, batch: torch.Tensor, recon: torch.Tensor, metrics: dict, *, force: bool = False) -> None:
         if not self.training_preview_enabled_var.get() and not self.timelapse_enabled_var.get():
             return
 
@@ -2089,43 +2158,30 @@ Hardware Status
                 self._start_timelapse_session()
             self.timelapse_capture_interval = max(1, total_steps // TIMELAPSE_MAX_FRAMES)
 
-        should_preview = (
-            self.training_preview_enabled_var.get()
-            and (force or step == 1 or step % TRAINING_VISUAL_PREVIEW_INTERVAL == 0 or step >= total_steps)
-        )
-        should_timelapse = (
-            self.timelapse_enabled_var.get()
-            and (force or step == 1 or step >= total_steps or step - self.timelapse_last_capture_step >= self.timelapse_capture_interval)
-        )
+        should_preview = self.training_preview_enabled_var.get() and (force or step == 1 or step % TRAINING_VISUAL_PREVIEW_INTERVAL == 0 or step >= total_steps)
+        should_timelapse = self.timelapse_enabled_var.get() and (force or step == 1 or step >= total_steps or step - self.timelapse_last_capture_step >= self.timelapse_capture_interval)
         if not should_preview and not should_timelapse:
             return
 
         try:
             input_tensor = batch[0].detach().cpu()
             recon_tensor = recon[0].detach().cpu()
+            if self._is_wavelet_mode():
+                input_tensor = self._decode_model_output_to_rgb(input_tensor)
+                recon_tensor = self._decode_model_output_to_rgb(recon_tensor)
         except Exception:
             return
 
         if should_preview:
             try:
-                preview = self._training_visual_frame(
-                    input_tensor,
-                    recon_tensor,
-                    metrics,
-                    self._current_training_video_layout(),
-                )
+                preview = self._training_visual_frame(input_tensor, recon_tensor, metrics, self._current_training_video_layout())
                 self._after(0, lambda img=preview: self._display_image(img))
             except Exception:
                 pass
 
         if should_timelapse and self.timelapse_frames_dir is not None:
             try:
-                frame = self._training_visual_frame(
-                    input_tensor,
-                    recon_tensor,
-                    metrics,
-                    self.timelapse_layout,
-                )
+                frame = self._training_visual_frame(input_tensor, recon_tensor, metrics, self.timelapse_layout)
             except Exception:
                 return
             self.timelapse_frame_count += 1
@@ -2173,17 +2229,14 @@ Hardware Status
         if not self.last_generated_latents:
             messagebox.showerror("Save Seed", "Generate at least one image first.")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".pt",
-            filetypes=[("Latent seed", "*.pt"), ("All files", "*.*")],
-            parent=self.root,
-        )
+        path = filedialog.asksaveasfilename(defaultextension=".pt", filetypes=[("Latent seed", "*.pt"), ("All files", "*.*")], parent=self.root)
         if not path:
             return
         payload = {
             "latent": self.last_generated_latents[0].detach().cpu(),
             "prompt": self.generation_prompt_var.get().strip(),
             "personality": self.personality_var.get(),
+            "reconstruction_mode": self._get_reconstruction_mode(),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
         torch.save(payload, path)
@@ -2193,20 +2246,18 @@ Hardware Status
         if self.model is None:
             messagebox.showerror("Load Seed", "Load or train a model first.")
             return
-        path = filedialog.askopenfilename(
-            filetypes=[("Latent seed", "*.pt"), ("All files", "*.*")],
-            parent=self.root,
-        )
+        path = filedialog.askopenfilename(filetypes=[("Latent seed", "*.pt"), ("All files", "*.*")], parent=self.root)
         if not path:
             return
         payload = safe_torch_load(path, map_location="cpu")
         latent = payload["latent"] if isinstance(payload, dict) and "latent" in payload else payload
-        self._render_latent_gallery(
-            [latent.detach().float()],
-            mode="seed_recall",
-            status_label=f"Loaded seed: {Path(path).name}",
-            save_memory=False,
-        )
+        
+        if isinstance(payload, dict) and "reconstruction_mode" in payload:
+            seed_mode = payload["reconstruction_mode"]
+            if seed_mode != self._get_reconstruction_mode():
+                messagebox.showwarning("Mode Mismatch", f"Seed was saved in {seed_mode} mode, but current mode is {self._get_reconstruction_mode()}.")
+
+        self._render_latent_gallery([latent.detach().float()], mode="seed_recall", status_label=f"Loaded seed: {Path(path).name}", save_memory=False)
         if isinstance(payload, dict):
             prompt = str(payload.get("prompt", "")).strip()
             if prompt:
@@ -2219,13 +2270,9 @@ Hardware Status
         elif self.model is not None:
             model_name = f"latent-{self.model.latent_dim}"
         record = self.memory_bank.save_memory(
-            image,
-            latent,
-            prompt=self.generation_prompt_var.get().strip(),
-            mode=mode,
-            personality=self.personality_var.get(),
-            model_name=model_name,
-            metadata=extra or {},
+            image, latent, prompt=self.generation_prompt_var.get().strip(),
+            mode=mode, personality=self.personality_var.get(),
+            model_name=model_name, metadata=extra or {}
         )
         self._refresh_memory_list()
         return record
@@ -2248,12 +2295,7 @@ Hardware Status
             messagebox.showerror("Recall Memory", "Select a memory first.")
             return
         latent = self.memory_bank.load_latent(record).detach().float()
-        self._render_latent_gallery(
-            [latent],
-            mode="memory_recall",
-            status_label=f"Recalled memory: {record.memory_id}",
-            save_memory=False,
-        )
+        self._render_latent_gallery([latent], mode="memory_recall", status_label=f"Recalled memory: {record.memory_id}", save_memory=False)
 
     def _use_memory_prompt(self):
         record = self._get_selected_memory_record()
@@ -2299,22 +2341,14 @@ Hardware Status
     def _on_latent_map_click(self, event):
         if not self.latent_map_points:
             return
-        best_point = min(
-            self.latent_map_points,
-            key=lambda point: (point["x"] - event.x) ** 2 + (point["y"] - event.y) ** 2,
-        )
+        best_point = min(self.latent_map_points, key=lambda point: (point["x"] - event.x) ** 2 + (point["y"] - event.y) ** 2)
         record = best_point["record"]
         try:
             latent = self.memory_bank.load_latent(record).detach().float()
         except Exception as exc:
             messagebox.showerror("Latent Map", str(exc))
             return
-        self._render_latent_gallery(
-            [latent],
-            mode="latent_map_recall",
-            status_label=f"Latent map jump: {record.memory_id}",
-            save_memory=False,
-        )
+        self._render_latent_gallery([latent], mode="latent_map_recall", status_label=f"Latent map jump: {record.memory_id}", save_memory=False)
 
     @staticmethod
     def _coerce_int(value) -> int | None:
@@ -2346,6 +2380,9 @@ Hardware Status
             metadata.setdefault("latent_dim", checkpoint.get("latent_dim"))
             metadata.setdefault("output_size", checkpoint.get("output_size"))
             metadata.setdefault("version", checkpoint.get("version"))
+            metadata.setdefault("reconstruction_mode", checkpoint.get("reconstruction_mode", "RGB VAE"))
+            metadata.setdefault("in_channels", checkpoint.get("in_channels", 3))
+            metadata.setdefault("out_channels", checkpoint.get("out_channels", 3))
 
         epochs = self._coerce_int(metadata.get("epochs"))
         total_epochs = self._coerce_int(metadata.get("total_epochs"))
@@ -2365,19 +2402,21 @@ Hardware Status
             "resolution": metadata.get("resolution") or metadata.get("output_size"),
             "saved_at": metadata.get("saved_at"),
             "version": metadata.get("version"),
+            "reconstruction_mode": metadata.get("reconstruction_mode", "RGB VAE"),
             "path": model_path,
         }
 
     def _format_model_details(self, details: dict) -> str:
         relative_path = details["path"]
         try:
-            relative_path = relative_path.relative_to(Path("Models"))
+            relative_path = relative_path.relative_to(MODELS_DIR)
         except ValueError:
             relative_path = details["path"]
 
         lines = [
             f"Model: {details['path'].name}",
             f"Folder: {relative_path.parent if relative_path.parent != Path('.') else 'Models'}",
+            f"Reconstruction Mode: {self._format_metadata_value(details.get('reconstruction_mode'))}",
             f"Dataset label: {self._format_metadata_value(details.get('dataset_label'))}",
             f"Dataset image count: {self._format_metadata_value(details.get('dataset_image_count'))}",
             f"Epochs per chunk: {self._format_metadata_value(details.get('epochs'))}",
@@ -2394,7 +2433,7 @@ Hardware Status
         return "\n".join(lines)
 
     def _open_model_map(self):
-        models_folder = Path("Models")
+        models_folder = MODELS_DIR
         if not models_folder.exists():
             messagebox.showerror("PyTorch Map", f"Model folder not found:\n{models_folder.resolve()}")
             return
@@ -2411,10 +2450,7 @@ Hardware Status
             container.columnconfigure(1, weight=2)
             container.rowconfigure(1, weight=1)
 
-            ttk.Label(
-                container,
-                text="Browse trained checkpoints in Models and click a .pt file to inspect its training metadata.",
-            ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+            ttk.Label(container, text="Browse trained checkpoints in Models and click a .pt file to inspect its training metadata.").grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
 
             tree_frame = ttk.Frame(container)
             tree_frame.grid(row=1, column=0, sticky=tk.NSEW, padx=(0, 10))
@@ -2434,12 +2470,7 @@ Hardware Status
             detail_frame.columnconfigure(0, weight=1)
             detail_frame.rowconfigure(0, weight=1)
 
-            ttk.Label(
-                detail_frame,
-                textvariable=self.model_map_details_var,
-                justify=tk.LEFT,
-                anchor=tk.NW,
-            ).grid(row=0, column=0, sticky=tk.NSEW)
+            ttk.Label(detail_frame, textvariable=self.model_map_details_var, justify=tk.LEFT, anchor=tk.NW).grid(row=0, column=0, sticky=tk.NSEW)
 
         self._refresh_model_map()
         self.model_map_window.deiconify()
@@ -2448,8 +2479,7 @@ Hardware Status
     def _refresh_model_map(self):
         if self.model_map_tree is None:
             return
-
-        models_folder = Path("Models")
+        models_folder = MODELS_DIR
         self.model_map_tree.delete(*self.model_map_tree.get_children())
         self.model_map_item_paths = {}
         self.model_map_details_var.set("Select a .pt model to inspect its training details.")
@@ -2490,10 +2520,7 @@ Hardware Status
         if self.model is None:
             messagebox.showerror("Memory Retrain", "Load or train a model first.")
             return
-        memory_paths = self.memory_bank.get_weighted_image_paths(
-            limit=32,
-            recent_bias=float(self.memory_recent_weight_var.get()),
-        )
+        memory_paths = self.memory_bank.get_weighted_image_paths(limit=32, recent_bias=float(self.memory_recent_weight_var.get()))
         if not memory_paths:
             messagebox.showerror("Memory Retrain", "No saved memories were found.")
             return
@@ -2527,12 +2554,7 @@ Hardware Status
         count = max(4, min(8, int(self.evolution_count_var.get())))
         self.evolution_selection_var.set("")
         self.evolution_candidates = [{"latent": self._get_random_latent()} for _ in range(count)]
-        self._render_latent_gallery(
-            [candidate["latent"] for candidate in self.evolution_candidates],
-            mode="evolution_round",
-            numbered=True,
-            status_label=f"Evolution round ready. Pick favorites from 1-{count}.",
-        )
+        self._render_latent_gallery([candidate["latent"] for candidate in self.evolution_candidates], mode="evolution_round", numbered=True, status_label=f"Evolution round ready. Pick favorites from 1-{count}.")
 
     def _breed_evolution_favorites(self):
         if self.model is None:
@@ -2541,26 +2563,180 @@ Hardware Status
         if not self.evolution_candidates:
             messagebox.showerror("Evolution", "Run an evolution round first.")
             return
-        selected = parse_selection_indices(
-            self.evolution_selection_var.get(),
-            upper_bound=len(self.evolution_candidates),
-        )
+        selected = parse_selection_indices(self.evolution_selection_var.get(), upper_bound=len(self.evolution_candidates))
         if not selected:
             messagebox.showerror("Evolution", "Enter favorite candidate numbers like 1,3,4.")
             return
         parents = [self.evolution_candidates[idx]["latent"] for idx in selected]
-        child_latents = breed_latents(
-            parents,
-            noise_scale=max(0.05, self.var_scale.get() / 12.0),
-            child_count=len(self.evolution_candidates),
-        )
+        child_latents = breed_latents(parents, noise_scale=max(0.05, self.var_scale.get() / 12.0), child_count=len(self.evolution_candidates))
         self.evolution_candidates = [{"latent": latent} for latent in child_latents]
-        self._render_latent_gallery(
-            child_latents,
-            mode="evolution_breed",
-            numbered=True,
-            status_label=f"Bred {len(child_latents)} children from favorites {self.evolution_selection_var.get()}",
-        )
+        self._render_latent_gallery(child_latents, mode="evolution_breed", numbered=True, status_label=f"Bred {len(child_latents)} children from favorites {self.evolution_selection_var.get()}")
+
+    def _ensure_reconstruction_judge(self):
+        if ReconstructionJudge is None:
+            messagebox.showerror("Reconstruction Judge", "reconstruction_judge.py could not be imported.", parent=self.root)
+            return None
+        if self.reconstruction_judge is None:
+            try:
+                self.status_var.set("Loading Reconstruction Judge...")
+                self.root.update_idletasks()
+                self.reconstruction_judge = ReconstructionJudge(memory_bank=self.memory_bank, device=self.device)
+            except Exception as exc:
+                messagebox.showerror("Reconstruction Judge", str(exc), parent=self.root)
+                return None
+        return self.reconstruction_judge
+
+    def _ensure_memory_finder(self):
+        if MemoryFinder is None:
+            messagebox.showerror("Memory Finder", "memory_finder.py could not be imported.", parent=self.root)
+            return None
+        if self.memory_finder is None:
+            try:
+                self.status_var.set("Loading Memory Finder...")
+                self.root.update_idletasks()
+                self.memory_finder = MemoryFinder(memory_bank=self.memory_bank, device=self.device)
+            except Exception as exc:
+                messagebox.showerror("Memory Finder", str(exc), parent=self.root)
+                return None
+        return self.memory_finder
+
+    def _compose_judged_grid(self, ranked_items, columns: int = 3):
+        if not ranked_items:
+            raise ValueError("No judged images to compose.")
+        width, height = ranked_items[0]["image"].size
+        columns = max(1, columns)
+        rows = math.ceil(len(ranked_items) / columns)
+        pad = 12
+        label_h = 56
+        canvas = Image.new("RGB", (columns * width + (columns + 1) * pad, rows * (height + label_h) + (rows + 1) * pad), color=(8, 10, 18))
+        draw = ImageDraw.Draw(canvas)
+        for grid_idx, item in enumerate(ranked_items, start=1):
+            row = (grid_idx - 1) // columns
+            col = (grid_idx - 1) % columns
+            x = pad + col * (width + pad)
+            y = pad + row * (height + label_h + pad)
+            img = item["image"].resize((width, height), Image.Resampling.LANCZOS)
+            canvas.paste(img, (x, y))
+            scores = item["scores"]
+            label = f"#{grid_idx}  total {scores.combined_score:.2f}\nS {scores.structure_score:.2f}  ID {scores.identity_score:.2f}  C {scores.composition_score:.2f}  Free {scores.dream_freedom_score:.2f}"
+            draw.text((x, y + height + 5), label, fill=(235, 240, 255))
+        return canvas
+
+    def _judge_generate_candidates(self):
+        if self.model is None:
+            messagebox.showerror("Reconstruction Judge", "Load or train an APVD model first.", parent=self.root)
+            return
+        judge = self._ensure_reconstruction_judge()
+        if judge is None:
+            return
+
+        reference = None
+        if messagebox.askyesno("Reconstruction Judge", "Use a reference image for structure/identity scoring?", parent=self.root):
+            ref_path = filedialog.askopenfilename(title="Select reference image", filetypes=self.FILE_TYPES, parent=self.root)
+            if ref_path:
+                try:
+                    reference = Image.open(ref_path).convert("RGB")
+                except Exception as exc:
+                    messagebox.showerror("Reconstruction Judge", f"Could not open reference image:\n{exc}", parent=self.root)
+                    return
+
+        count = max(4, min(8, int(self.evolution_count_var.get())))
+        top_k = max(1, min(count, int(self.judge_top_k_var.get())))
+        min_score = float(self.judge_min_score_var.get())
+        latents = [self._get_random_latent() for _ in range(count)]
+        candidates = []
+
+        self.status_var.set(f"Judge is scoring {count} APVD dreams...")
+        self.root.update_idletasks()
+        with torch.no_grad():
+            for latent in latents:
+                latent_device = latent.to(self.device)
+                image = tensor_to_pil(self._decode_model_output_to_rgb(self._decode_latent(latent_device, show_steps=False)))
+                candidates.append((image, latent_device.detach().cpu()))
+
+        ranked = judge.rank(candidates, reference=reference)
+        selected_indices = {idx for idx, scores in ranked[:top_k] if scores.combined_score >= min_score}
+        ranked_items = []
+        saved = 0
+        for original_idx, scores in ranked:
+            image, latent = candidates[original_idx]
+            ranked_items.append({"image": image, "latent": latent, "scores": scores})
+            if original_idx in selected_indices:
+                self._remember_generation(image, latent, mode="judge_selected", extra={"judge_scores": scores.to_dict()})
+                saved += 1
+
+        self.last_generated_latents = [item["latent"] for item in ranked_items]
+        self.evolution_candidates = [{"latent": item["latent"], "judge_scores": item["scores"].to_dict()} for item in ranked_items]
+        self._display_image(self._compose_judged_grid(ranked_items))
+        self.status_var.set(f"Judge ranked {count} dreams and saved {saved} best candidate(s) to memory.")
+
+    def _memory_finder_search(self):
+        finder = self._ensure_memory_finder()
+        if finder is None:
+            return
+        ref_path = filedialog.askopenfilename(title="Select reference image for Memory Finder", filetypes=self.FILE_TYPES, parent=self.root)
+        if not ref_path:
+            return
+        try:
+            reference = Image.open(ref_path).convert("RGB")
+        except Exception as exc:
+            messagebox.showerror("Memory Finder", f"Could not open reference image:\n{exc}", parent=self.root)
+            return
+
+        top_k = max(1, min(12, int(self.memory_finder_top_k_var.get())))
+        self.status_var.set("Building/searching APVD memory index...")
+        self.root.update_idletasks()
+        try:
+            if hasattr(finder, "invalidate_index"):
+                finder.invalidate_index()
+            matches = finder.find(reference, top_k=top_k, search_limit=256, output_image_size=256)
+        except Exception as exc:
+            messagebox.showerror("Memory Finder", str(exc), parent=self.root)
+            return
+
+        if not matches:
+            messagebox.showinfo("Memory Finder", "No memory matches were found yet.", parent=self.root)
+            self.status_var.set("Memory Finder found no matches.")
+            return
+
+        images = []
+        labels = []
+        for idx, match in enumerate(matches, start=1):
+            try:
+                img = Image.open(match.image_path).convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
+                if match.attention_region:
+                    draw = ImageDraw.Draw(img)
+                    x, y, w, h = match.attention_region
+                    draw.rectangle((x, y, x + w, y + h), outline=(255, 255, 255), width=2)
+                images.append(img)
+                labels.append(f"#{idx} score {match.combined_score:.2f}  id {match.identity_similarity:.2f}  struct {match.structure_similarity:.2f}")
+            except Exception:
+                continue
+
+        if not images:
+            messagebox.showinfo("Memory Finder", "Matches existed, but their images could not be opened.", parent=self.root)
+            return
+
+        grid = self._compose_memory_finder_grid(images, labels)
+        self._display_image(grid)
+        best = matches[0]
+        self.status_var.set(f"Memory Finder found {len(matches)} match(es). Best: {best.combined_score:.2f} from {Path(best.image_path).name}")
+
+    def _compose_memory_finder_grid(self, images, labels, columns: int = 3):
+        width, height = images[0].size
+        rows = math.ceil(len(images) / columns)
+        pad = 12
+        label_h = 42
+        canvas = Image.new("RGB", (columns * width + (columns + 1) * pad, rows * (height + label_h) + (rows + 1) * pad), color=(8, 10, 18))
+        draw = ImageDraw.Draw(canvas)
+        for idx, img in enumerate(images):
+            row = idx // columns
+            col = idx % columns
+            x = pad + col * (width + pad)
+            y = pad + row * (height + label_h + pad)
+            canvas.paste(img, (x, y))
+            draw.text((x, y + height + 5), labels[idx], fill=(235, 240, 255))
+        return canvas
 
     def _select_images(self):
         paths = filedialog.askopenfilenames(title="Select training images", filetypes=self.FILE_TYPES)
@@ -2572,24 +2748,11 @@ Hardware Status
         self.status_var.set(f"Selected {len(self.training_paths)} images.")
 
     def _select_videos(self):
-        paths = filedialog.askopenfilenames(
-            title="Select training video(s)",
-            filetypes=self.VIDEO_FILE_TYPES,
-        )
+        paths = filedialog.askopenfilenames(title="Select training video(s)", filetypes=self.VIDEO_FILE_TYPES)
         if not paths:
             return
         self.video_paths = [Path(p) for p in paths]
-        n = len(self.video_paths)
-        extra = ""
-        extra_parts = []
-        if self.training_paths:
-            extra_parts.append(f"{len(self.training_paths)} image(s)")
-        if self.archive_entries:
-            extra_parts.append(f"{len(self.archive_entries)} from archive(s)")
-        extra = ""
-        if extra_parts:
-            extra = " Will merge with " + " and ".join(extra_parts) + " on train."
-        self.status_var.set(f"Selected {n} video file(s).{extra}")
+        self.status_var.set(f"Selected {len(self.video_paths)} video file(s).")
 
     def _select_batch_folder(self):
         folder = filedialog.askdirectory(title="Select parent folder with dataset subfolders")
@@ -2598,28 +2761,18 @@ Hardware Status
         root = Path(folder)
         dataset_folders = self._find_batch_dataset_folders(root)
         if not dataset_folders:
-            messagebox.showerror(
-                "Error",
-                "No dataset subfolders with images were found.\n"
-                "Put each dataset in its own folder inside the selected parent folder.",
-            )
+            messagebox.showerror("Error", "No dataset subfolders with images were found.")
             return
-
         self.batch_training_root = root
         self.batch_training_folders = dataset_folders
         self.training_folder = None
         self.training_paths = None
         self.archive_entries = []
         self.video_paths = []
-        self.status_var.set(
-            f"Queued {len(dataset_folders)} dataset folder(s) for batch training."
-        )
+        self.status_var.set(f"Queued {len(dataset_folders)} dataset folder(s) for batch training.")
 
     def _select_archives(self):
-        paths = filedialog.askopenfilenames(
-            title="Select training archive(s)",
-            filetypes=self.ARCHIVE_FILE_TYPES,
-        )
+        paths = filedialog.askopenfilenames(title="Select training archive(s)", filetypes=self.ARCHIVE_FILE_TYPES)
         if not paths:
             return
         new_entries: list[tuple[Path, str]] = []
@@ -2628,20 +2781,14 @@ Hardware Status
             ap = Path(p)
             members = list_image_members(ap)
             if not members:
-                messagebox.showerror(
-                    "Error",
-                    f"No supported images found in archive (or unsupported format):\n{ap.name}",
-                )
+                messagebox.showerror("Error", f"No supported images found in archive:\n{ap.name}")
                 continue
             n_ok += 1
             new_entries.extend((ap, m) for m in members)
         if not new_entries:
             return
         self.archive_entries.extend(new_entries)
-        self.status_var.set(
-            f"Added {len(new_entries)} image(s) from {n_ok} archive(s). "
-            f"Total from archives: {len(self.archive_entries)}."
-        )
+        self.status_var.set(f"Added {len(new_entries)} image(s) from {n_ok} archive(s).")
 
     def _clear_training_sources(self):
         self.training_paths = None
@@ -2666,11 +2813,7 @@ Hardware Status
         self.status_var.set(f"Found {len(paths)} images in folder.")
 
     def _export_reconstruction_video(self):
-        frame_paths = filedialog.askopenfilenames(
-            title="Select ordered latent traversal frames",
-            filetypes=self.FILE_TYPES,
-            parent=self.root,
-        )
+        frame_paths = filedialog.askopenfilenames(title="Select ordered latent traversal frames", filetypes=self.FILE_TYPES, parent=self.root)
         if not frame_paths:
             return
         if len(frame_paths) < 2:
@@ -2678,59 +2821,28 @@ Hardware Status
             return
 
         original_path = None
-        if messagebox.askyesno(
-            "Reconstruction Video",
-            "Include an original input image for the initialization and final comparison phases?",
-            parent=self.root,
-        ):
-            picked = filedialog.askopenfilename(
-                title="Select original input image",
-                filetypes=self.FILE_TYPES,
-                parent=self.root,
-            )
+        if messagebox.askyesno("Reconstruction Video", "Include an original input image for the initialization and final comparison phases?", parent=self.root):
+            picked = filedialog.askopenfilename(title="Select original input image", filetypes=self.FILE_TYPES, parent=self.root)
             if picked:
                 original_path = picked
 
         audio_path = None
-        if messagebox.askyesno(
-            "Reconstruction Video",
-            "Add an ambient audio track if you have one?",
-            parent=self.root,
-        ):
-            picked = filedialog.askopenfilename(
-                title="Select optional audio track",
-                filetypes=self.AUDIO_FILE_TYPES,
-                parent=self.root,
-            )
+        if messagebox.askyesno("Reconstruction Video", "Add an ambient audio track if you have one?", parent=self.root):
+            picked = filedialog.askopenfilename(title="Select optional audio track", filetypes=self.AUDIO_FILE_TYPES, parent=self.root)
             if picked:
                 audio_path = picked
 
-        resolution_text = simpledialog.askstring(
-            "Reconstruction Video",
-            "Output resolution (`1920x1080` or `1280x720`):",
-            initialvalue="1920x1080",
-            parent=self.root,
-        )
+        resolution_text = simpledialog.askstring("Reconstruction Video", "Output resolution (`1920x1080` or `1280x720`):", initialvalue="1920x1080", parent=self.root)
         if not resolution_text:
             return
         resolution_text = resolution_text.strip().lower().replace(" ", "")
-        resolution_map = {
-            "1920x1080": (1920, 1080),
-            "1280x720": (1280, 720),
-        }
+        resolution_map = {"1920x1080": (1920, 1080), "1280x720": (1280, 720)}
         resolution = resolution_map.get(resolution_text)
         if resolution is None:
             messagebox.showerror("Reconstruction Video", "Resolution must be `1920x1080` or `1280x720`.")
             return
 
-        fps = simpledialog.askinteger(
-            "Reconstruction Video",
-            "FPS (`30` or `60`):",
-            initialvalue=30,
-            minvalue=30,
-            maxvalue=60,
-            parent=self.root,
-        )
+        fps = simpledialog.askinteger("Reconstruction Video", "FPS (`30` or `60`):", initialvalue=30, minvalue=30, maxvalue=60, parent=self.root)
         if fps is None:
             return
         if fps not in {30, 60}:
@@ -2738,14 +2850,7 @@ Hardware Status
             return
 
         suggested_name = f"reconstruction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-        output_path = filedialog.asksaveasfilename(
-            title="Save reconstruction video",
-            defaultextension=".mp4",
-            initialdir=str(Path("Outputs").resolve()),
-            initialfile=suggested_name,
-            filetypes=[("MP4 video", "*.mp4"), ("All files", "*.*")],
-            parent=self.root,
-        )
+        output_path = filedialog.asksaveasfilename(title="Save reconstruction video", defaultextension=".mp4", initialdir=str(OUTPUTS_DIR.resolve()), initialfile=suggested_name, filetypes=[("MP4 video", "*.mp4"), ("All files", "*.*")], parent=self.root)
         if not output_path:
             return
 
@@ -2753,49 +2858,23 @@ Hardware Status
         self.status_var.set("Rendering Reconstruction Video Mode...")
 
         def progress_update(done: int, total: int):
-            self._after(
-                0,
-                lambda d=done, t=total: self.status_var.set(
-                    f"Rendering Reconstruction Video Mode... {int((d / max(1, t)) * 100)}%"
-                ),
-            )
+            self._after(0, lambda d=done, t=total: self.status_var.set(f"Rendering Reconstruction Video Mode... {int((d / max(1, t)) * 100)}%"))
 
         def render_job():
             try:
                 result = render_reconstruction_video(
-                    ordered_paths,
-                    Path(output_path),
+                    ordered_paths, Path(output_path),
                     original_image_path=Path(original_path) if original_path else None,
                     audio_path=Path(audio_path) if audio_path else None,
-                    resolution=resolution,
-                    fps=fps,
-                    progress_callback=progress_update,
+                    resolution=resolution, fps=fps, progress_callback=progress_update
                 )
             except Exception as exc:
-                self._after(
-                    0,
-                    lambda: (
-                        self.status_var.set("Reconstruction video export failed."),
-                        messagebox.showerror("Reconstruction Video", str(exc), parent=self.root),
-                    ),
-                )
+                self._after(0, lambda: (self.status_var.set("Reconstruction video export failed."), messagebox.showerror("Reconstruction Video", str(exc), parent=self.root)))
                 return
 
             codec_note = "H.264" if result.used_h264 else "MP4 fallback codec"
             audio_note = " with audio" if result.audio_included else ""
-            self._after(
-                0,
-                lambda: (
-                    self.status_var.set(
-                        f"Saved reconstruction video: {result.output_path.name} ({result.duration_seconds:.1f}s, {codec_note}{audio_note})."
-                    ),
-                    messagebox.showinfo(
-                        "Reconstruction Video",
-                        f"Saved video to:\n{result.output_path}\n\nDuration: {result.duration_seconds:.1f}s\nCodec: {codec_note}",
-                        parent=self.root,
-                    ),
-                ),
-            )
+            self._after(0, lambda: (self.status_var.set(f"Saved reconstruction video: {result.output_path.name} ({result.duration_seconds:.1f}s, {codec_note}{audio_note})."), messagebox.showinfo("Reconstruction Video", f"Saved video to:\n{result.output_path}\n\nDuration: {result.duration_seconds:.1f}s\nCodec: {codec_note}", parent=self.root)))
 
         threading.Thread(target=render_job, daemon=True).start()
 
@@ -2804,10 +2883,7 @@ Hardware Status
         has_images = bool(self.training_paths) or bool(self.archive_entries)
         has_videos = bool(self.video_paths)
         if not has_batch_folders and not has_images and not has_videos:
-            messagebox.showerror(
-                "Error",
-                "Select images, a folder, a batch folder, archive(s), and/or video(s) first.",
-            )
+            messagebox.showerror("Error", "Select images, a folder, a batch folder, archive(s), and/or video(s) first.")
             return
         self.is_training = True
         self.training_pause_event.set()
@@ -2816,8 +2892,8 @@ Hardware Status
         self.stop_btn.config(state=tk.NORMAL)
         if self.timelapse_enabled_var.get():
             self._start_timelapse_session()
-        training_thread = threading.Thread(target=self._training_loop, daemon=True)
-        training_thread.start()
+        self.training_thread = threading.Thread(target=self._training_loop, daemon=True)
+        self.training_thread.start()
 
     def _stop_training(self):
         self.is_training = False
@@ -2858,10 +2934,17 @@ Hardware Status
     def _build_model_checkpoint(self) -> dict:
         if self.model is None:
             raise ValueError("No model is loaded.")
+        mode = "Wavelet" if self._model_uses_wavelet() else "RGB VAE"
+        in_ch = int(getattr(self.model, "in_channels", 12 if mode == "Wavelet" else 3))
+        out_ch = int(getattr(self.model, "out_channels", 12 if mode == "Wavelet" else 3))
         return {
             "model_state_dict": self.model.state_dict(),
             "latent_dim": self.model.latent_dim,
             "output_size": self.model.output_size,
+            "in_channels": in_ch,
+            "out_channels": out_ch,
+            "output_activation": getattr(self.model, "output_activation", "identity" if mode == "Wavelet" else "sigmoid"),
+            "reconstruction_mode": mode,
             "version": "2.3-mini-diffusion",
             "training_metadata": dict(self.last_training_metadata),
         }
@@ -2871,7 +2954,6 @@ Hardware Status
         candidate = target_dir / f"{stem}.pt"
         if not candidate.exists():
             return candidate
-
         index = 2
         while True:
             candidate = target_dir / f"{stem} ({index}).pt"
@@ -2905,8 +2987,9 @@ Hardware Status
         batch_total: int | None = None,
     ) -> bool:
         if reset_model:
-            self.model = None
-            self.loaded_model_path = None
+            with self.model_lock:
+                self.model = None
+                self.loaded_model_path = None
 
         image_paths = [Path(path) for path in (training_paths or [])]
         archive_entries = list(archive_entries or [])
@@ -2915,56 +2998,62 @@ Hardware Status
             raise ValueError("No training data sources were provided.")
 
         target_size = (resolution, resolution)
-        if self.model is None or getattr(self.model, "output_size", target_size) != target_size:
-            self.model = VAE(latent_dim=256, output_size=target_size).to(self.device)
-            self.loaded_model_path = None
+        is_wavelet = self._is_wavelet_mode()
+        model_output_size = self._wavelet_size_for_resolution(resolution) if is_wavelet else target_size
+        in_channels = 12 if is_wavelet else 3
+        out_channels = 12 if is_wavelet else 3
+        output_activation = "identity" if is_wavelet else "sigmoid"
 
-        amp_enabled = getattr(self.device, "type", "") == "cuda"
-        if amp_enabled:
+        with self.model_lock:
+            if (
+                self.model is None
+                or getattr(self.model, "output_size", model_output_size) != model_output_size
+                or int(getattr(self.model, "in_channels", 3)) != in_channels
+                or getattr(self.model, "output_activation", "sigmoid") != output_activation
+            ):
+                self.model = VAE(
+                    latent_dim=256,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    output_size=model_output_size,
+                    output_activation=output_activation,
+                ).to(self.device)
+                self.loaded_model_path = None
+
+        precision = self._resolve_precision_settings()
+        amp_enabled = bool(precision["autocast_enabled"])
+        scaler_enabled = bool(precision["scaler_enabled"])
+        autocast_dtype = precision["autocast_dtype"]
+        non_blocking = bool(precision["non_blocking"])
+        if getattr(self.device, "type", "") == "cuda":
             torch.backends.cudnn.benchmark = True
 
+        batch_size = max(1, min(256, int(self.batch_size_var.get())))
+        # Workers are CPU processes. Huge values usually slow Windows down, so keep this realistic.
+        max_workers = max(0, min(32, (os.cpu_count() or 4) - 1))
+        loader_workers = max(0, min(max_workers, int(self.loader_workers_var.get())))
+        # Prefetch is allowed to be larger than the old 16 cap, but it still represents batches per worker.
+        prefetch_batches = max(1, min(512, int(self.prefetch_batches_var.get())))
+        cache_total = max(0, min(200000, int(self.dataset_cache_items_var.get())))
+        cache_per_worker = self._cache_items_per_worker(cache_total, loader_workers)
         dataset = APVDDataset(
-            image_paths,
-            resolution,
+            image_paths, resolution,
             archive_entries=archive_entries,
             video_paths=video_paths,
             video_stride=self.video_stride_var.get(),
             video_max_frames=self.video_max_frames_var.get(),
+            wavelet_mode=is_wavelet,
+            cache_limit=cache_per_worker,
         )
-        batch_size = max(1, min(256, int(self.batch_size_var.get())))
-        loader_workers = max(0, min(16, int(self.loader_workers_var.get())))
-        prefetch_batches = max(1, min(16, int(self.prefetch_batches_var.get())))
         learning_rate = max(1e-7, min(0.1, float(self.learning_rate_var.get())))
         intensity_profile = self._training_intensity_profile()
         training_intensity = int(intensity_profile["percent"])
         throttle_cap = float(intensity_profile["throttle_cap"])
-        self._after(
-            0,
-            lambda bs=batch_size, lw=loader_workers, pf=prefetch_batches, lr=learning_rate: (
-                self.batch_size_var.set(bs),
-                self.loader_workers_var.set(lw),
-                self.prefetch_batches_var.set(pf),
-                self.learning_rate_var.set(lr),
-            ),
-        )
+        self._after(0, lambda bs=batch_size, lw=loader_workers, pf=prefetch_batches, cache=cache_total, lr=learning_rate: (self.batch_size_var.set(bs), self.loader_workers_var.set(lw), self.prefetch_batches_var.set(pf), self.dataset_cache_items_var.set(cache), self.learning_rate_var.set(lr)))
 
-        loader_kwargs = {
-            "batch_size": batch_size,
-            "shuffle": True,
-            "num_workers": loader_workers,
-            "pin_memory": amp_enabled,
-        }
-        if loader_workers > 0:
-            loader_kwargs.update(
-                {
-                    "persistent_workers": True,
-                    "prefetch_factor": prefetch_batches,
-                }
-            )
-        data_loader = DataLoader(dataset, **loader_kwargs)
-
+        data_loader = self._build_training_dataloader(dataset, batch_size=batch_size, loader_workers=loader_workers, prefetch_batches=prefetch_batches, shuffle=True)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
-        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+        scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
         self.model.train()
         train_start = time.perf_counter()
         preview_parts: list[torch.Tensor] = []
@@ -2974,6 +3063,7 @@ Hardware Status
         total_training_images = len(dataset)
 
         self._after(0, lambda: self.load_progress_var.set(0.0))
+        self._after(0, lambda p=str(precision["requested"]), r=str(precision["resolved"]): self.status_var.set(f"Training using precision: {p} → {r}." if p == "Auto Recommended" else f"Training using precision: {r}."))
 
         prefix_parts: list[str] = []
         if batch_index is not None and batch_total is not None:
@@ -2996,8 +3086,8 @@ Hardware Status
                     return False
 
                 step_start = time.perf_counter()
-                batch = batch.to(self.device, non_blocking=amp_enabled).float()
-                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+                batch = batch.to(self.device, non_blocking=non_blocking).float()
+                batch = self._sanitize_model_batch(batch, is_wavelet=is_wavelet)
 
                 if len(preview_parts) < MAX_TRAINING_PREVIEW_IMAGES:
                     remaining = MAX_TRAINING_PREVIEW_IMAGES - len(preview_parts)
@@ -3005,14 +3095,36 @@ Hardware Status
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                autocast_kwargs = {"enabled": amp_enabled}
+                if autocast_dtype is not None:
+                    autocast_kwargs["dtype"] = autocast_dtype
+                with torch.amp.autocast("cuda", **autocast_kwargs):
                     recon, mu, logvar = self.model(batch)
                 with torch.amp.autocast("cuda", enabled=False):
-                    recon_loss = vae_loss(recon.float(), batch.float(), mu.float(), logvar.float())
+                    recon_loss = vae_loss(
+                        recon.float(),
+                        batch.float(),
+                        mu.float(),
+                        logvar.float(),
+                        reconstruction_loss="mse" if is_wavelet else "bce",
+                    )
                     denoise_loss = latent_denoiser_loss(self.model, mu.detach().float())
                     loss = recon_loss + (0.25 * denoise_loss)
 
+                if self.nan_guard_var.get() and not torch.isfinite(loss.detach()):
+                    old_lr = learning_rate
+                    learning_rate = max(learning_rate * 0.5, 1e-7)
+                    for group in optimizer.param_groups:
+                        group["lr"] = learning_rate
+                    if scaler_enabled:
+                        scaler.update()
+                    self._after(0, lambda old=old_lr, new=learning_rate: self.status_var.set(f"NaN/Inf loss caught. Skipped batch and lowered LR from {old:.6f} to {new:.6f}."))
+                    continue
+
                 scaler.scale(loss).backward()
+                if self.nan_guard_var.get():
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 epoch_loss += loss.detach().float().item()
@@ -3028,62 +3140,40 @@ Hardware Status
                 eta = (total_steps - completed_steps) * (elapsed / max(1, completed_steps))
                 running_avg = epoch_loss / max(1, batch_idx)
                 metrics = {
-                    "dataset_label": dataset_label,
-                    "epoch": epoch + 1,
-                    "epochs": n_epochs,
-                    "batch": batch_idx,
-                    "total_batches": total_batches,
-                    "loss": running_avg,
-                    "elapsed": elapsed,
-                    "eta": eta,
-                    "progress": progress,
-                    "step": completed_steps,
-                    "total_steps": total_steps,
+                    "dataset_label": dataset_label, "epoch": epoch + 1, "epochs": n_epochs,
+                    "batch": batch_idx, "total_batches": total_batches, "loss": running_avg,
+                    "elapsed": elapsed, "eta": eta, "progress": progress,
+                    "step": completed_steps, "total_steps": total_steps
                 }
-                self._handle_training_visual_snapshot(
-                    batch,
-                    recon.detach(),
-                    metrics,
-                    force=batch_idx == 1 or completed_steps >= total_steps,
-                )
+                self._handle_training_visual_snapshot(batch, recon.detach(), metrics, force=batch_idx == 1 or completed_steps >= total_steps)
                 self._after(0, lambda p=progress: self.load_progress_var.set(p))
                 if batch_idx == 1 or batch_idx % 350 == 0 or batch_idx == total_batches:
-                    self._after(
-                        0,
-                        lambda e=epoch, b=batch_idx, a=running_avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(
-                            f"{p}{label} | Epoch {e+1}/{n_epochs} | Batch {b}/{total_batches} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"
-                        ),
-                    )
+                    self._after(0, lambda e=epoch, b=batch_idx, a=running_avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(f"{p}{label} | Epoch {e+1}/{n_epochs} | Batch {b}/{total_batches} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"))
 
             avg = epoch_loss / total_batches
             elapsed = time.perf_counter() - train_start
             eta = (n_epochs - (epoch + 1)) * (elapsed / max(1, epoch + 1))
-            self._after(
-                0,
-                lambda e=epoch, a=avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(
-                    f"{p}{label} | Epoch {e+1}/{n_epochs} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"
-                ),
-            )
+            self._after(0, lambda e=epoch, a=avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(f"{p}{label} | Epoch {e+1}/{n_epochs} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"))
 
         if amp_enabled:
             torch.cuda.empty_cache()
 
         self.model.eval()
         self.last_training_metadata = {
-            "dataset_label": dataset_label,
-            "dataset_image_count": total_training_images,
-            "epochs": n_epochs,
-            "total_epochs": n_epochs,
-            "chunk_count": 1,
-            "source_count": len(image_paths),
-            "resolution": [resolution, resolution],
-            "batch_size": batch_size,
-            "learning_rate": learning_rate,
+            "dataset_label": dataset_label, "dataset_image_count": total_training_images,
+            "epochs": n_epochs, "total_epochs": n_epochs, "chunk_count": 1,
+            "source_count": len(image_paths), "resolution": [resolution, resolution],
+            "batch_size": batch_size, "learning_rate": learning_rate,
             "training_intensity": training_intensity,
-            "batch_load_workers": loader_workers,
-            "prefetch_batches": prefetch_batches,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "precision_mode": str(precision["requested"]),
+            "precision_resolved": str(precision["resolved"]),
+            "precision_dtype": str(precision["dtype_label"]),
+            "mixed_precision": bool(amp_enabled),
+            "nan_guard": bool(self.nan_guard_var.get()), "batch_load_workers": loader_workers,
+            "prefetch_batches": prefetch_batches, "saved_at": datetime.now().isoformat(timespec="seconds"),
             "version": "2.3-mini-diffusion",
+            "reconstruction_mode": self._get_reconstruction_mode(),
+            "input_channels": in_channels, "output_channels": out_channels
         }
         if preview_parts:
             self.training_tensors = torch.stack(preview_parts, dim=0)[:MAX_TRAINING_PREVIEW_IMAGES]
@@ -3093,11 +3183,13 @@ Hardware Status
         n_epochs = max(1, int(self.epochs_var.get()))
         resolution = int(self.resolution_var.get())
         resolution = max(32, min(1024, resolution))
+        if self._is_wavelet_mode() and resolution % 2 != 0:
+            resolution = min(1024, resolution + 1)
         self._after(0, lambda: self.resolution_var.set(resolution))
 
         try:
             if self.batch_training_folders:
-                models_folder = Path("Models")
+                models_folder = MODELS_DIR
                 models_folder.mkdir(parents=True, exist_ok=True)
                 total = len(self.batch_training_folders)
                 saved_paths: list[Path] = []
@@ -3111,20 +3203,10 @@ Hardware Status
                     if not dataset_paths:
                         continue
 
-                    self._after(
-                        0,
-                        lambda i=index, t=total, name=dataset_folder.name: self.status_var.set(
-                            f"[{i}/{t}] Preparing dataset: {name}"
-                        ),
-                    )
+                    self._after(0, lambda i=index, t=total, name=dataset_folder.name: self.status_var.set(f"[{i}/{t}] Preparing dataset: {name}"))
                     completed = self._train_dataset(
-                        n_epochs=n_epochs,
-                        resolution=resolution,
-                        dataset_label=dataset_folder.name,
-                        training_paths=dataset_paths,
-                        reset_model=True,
-                        batch_index=index,
-                        batch_total=total,
+                        n_epochs=n_epochs, resolution=resolution, dataset_label=dataset_folder.name,
+                        training_paths=dataset_paths, reset_model=True, batch_index=index, batch_total=total
                     )
                     if not completed:
                         break
@@ -3132,39 +3214,22 @@ Hardware Status
                     model_path = self._next_available_model_path(models_folder, dataset_folder.name)
                     self._save_model_to_path(model_path)
                     saved_paths.append(model_path)
-                    self._after(
-                        0,
-                        lambda i=index, t=total, p=model_path: self.status_var.set(
-                            f"[{i}/{t}] Saved {p.name} to Models."
-                        ),
-                    )
+                    self._after(0, lambda i=index, t=total, p=model_path: self.status_var.set(f"[{i}/{t}] Saved {p.name} to Models."))
 
                 if saved_paths and self.is_training:
-                    self._after(
-                        0,
-                        lambda count=len(saved_paths), last=saved_paths[-1].name: self.status_var.set(
-                            f"Batch training finished. Saved {count} model(s); last: {last}"
-                        ),
-                    )
+                    self._after(0, lambda count=len(saved_paths), last=saved_paths[-1].name: self.status_var.set(f"Batch training finished. Saved {count} model(s); last: {last}"))
             else:
                 memory_paths: list[Path] = []
                 if self.include_memory_training_var.get():
                     memory_limit = max(0, int(self.memory_training_limit_var.get()))
                     if memory_limit > 0:
-                        memory_paths = self.memory_bank.get_weighted_image_paths(
-                            limit=memory_limit,
-                            recent_bias=float(self.memory_recent_weight_var.get()),
-                        )
+                        memory_paths = self.memory_bank.get_weighted_image_paths(limit=memory_limit, recent_bias=float(self.memory_recent_weight_var.get()))
                 merged_training_paths = list(self.training_paths or [])
                 merged_training_paths.extend(memory_paths)
                 self._train_dataset(
-                    n_epochs=n_epochs,
-                    resolution=resolution,
-                    dataset_label="Current dataset",
-                    training_paths=merged_training_paths,
-                    archive_entries=self.archive_entries,
-                    video_paths=self.video_paths,
-                    reset_model=False,
+                    n_epochs=n_epochs, resolution=resolution, dataset_label="Current dataset",
+                    training_paths=merged_training_paths, archive_entries=self.archive_entries,
+                    video_paths=self.video_paths, reset_model=False
                 )
         except Exception as e:
             self._after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -3178,6 +3243,7 @@ Hardware Status
     def _finish_training(self):
         def _finish():
             self.is_training = False
+            self.training_thread = None
             self.training_pause_event.set()
             self.train_btn.config(state=tk.NORMAL)
             self.pause_btn.config(state=tk.DISABLED, text="Pause Training")
@@ -3203,14 +3269,42 @@ Hardware Status
         if self.realtime_dreamify_active:
             self._stop_realtime_dreamify()
         checkpoint = safe_torch_load(path, map_location=self.device)
+        
+        mode = checkpoint.get("reconstruction_mode")
+        if mode not in ["RGB VAE", "Wavelet"]:
+            saved_in_channels = checkpoint.get("in_channels")
+            if saved_in_channels is None:
+                first_weight = checkpoint.get("model_state_dict", {}).get("encoder.0.weight")
+                saved_in_channels = int(first_weight.shape[1]) if hasattr(first_weight, "shape") and len(first_weight.shape) >= 2 else 3
+            mode = "Wavelet" if int(saved_in_channels) == 12 else "RGB VAE"
+        self.reconstruction_mode_var.set(mode)
+        
+        if self._is_wavelet_mode():
+            in_ch = 12
+            out_ch = 12
+        else:
+            in_ch = 3
+            out_ch = 3
+
         output_size = tuple(checkpoint.get("output_size", (256, 256)))
-        self.model = VAE(latent_dim=checkpoint.get("latent_dim", 256), output_size=output_size).to(self.device)
-        self.loaded_model_path = Path(path)
-        self.last_training_metadata = self._extract_model_training_metadata(checkpoint, self.loaded_model_path)
-        load_result = self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        self.model.eval()
+        output_activation = checkpoint.get("output_activation", "identity" if mode == "Wavelet" else "sigmoid")
+        loaded_model = VAE(
+            latent_dim=checkpoint.get("latent_dim", 256),
+            in_channels=in_ch,
+            out_channels=out_ch,
+            output_size=output_size,
+            output_activation=output_activation,
+        ).to(self.device)
+        load_result = loaded_model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        loaded_model.eval()
+        
+        with self.model_lock:
+            self.model = loaded_model
+            self.loaded_model_path = Path(path)
+            self.last_training_metadata = self._extract_model_training_metadata(checkpoint, self.loaded_model_path)
         if len(output_size) == 2 and all(isinstance(v, int) for v in output_size):
-            self.resolution_var.set(int(output_size[0]))
+            display_size = self._rgb_size_for_wavelet_output(output_size) if mode == "Wavelet" else output_size
+            self.resolution_var.set(int(display_size[0]))
         missing = list(getattr(load_result, "missing_keys", []))
         has_denoiser = not any(key.startswith("latent_denoiser.") for key in missing)
         if not has_denoiser:
@@ -3222,9 +3316,7 @@ Hardware Status
             self.latent_diffusion = None
             self.loaded_latent_diffusion_path = None
             self.use_latent_diffusion_var.set(False)
-            self.status_var.set(
-                f"Model loaded: {path.name}.{note} Loaded DDPM was cleared because latent dimensions did not match."
-            )
+            self.status_var.set(f"Model loaded: {path.name}.{note} Loaded DDPM was cleared because latent dimensions did not match.")
 
     def _make_latent_diffusion(self) -> DiffusionModel:
         if self.model is None:
@@ -3240,10 +3332,7 @@ Hardware Status
         if self.latent_diffusion is None:
             raise ValueError("Train or load a Latent DDPM checkpoint first.")
         if self.latent_diffusion.config.latent_dim != self.model.latent_dim:
-            raise ValueError(
-                f"Latent DDPM uses {self.latent_diffusion.config.latent_dim} dims, "
-                f"but APVD uses {self.model.latent_dim} dims."
-            )
+            raise ValueError(f"Latent DDPM uses {self.latent_diffusion.config.latent_dim} dims, but APVD uses {self.model.latent_dim} dims.")
         return self.latent_diffusion.to(self.device).eval()
 
     def _build_latent_diffusion_loader(self, resolution: int) -> DataLoader:
@@ -3253,31 +3342,18 @@ Hardware Status
         batch_size = max(1, min(256, int(self.batch_size_var.get())))
 
         if image_paths or archive_entries or video_paths:
-            amp_enabled = getattr(self.device, "type", "") == "cuda"
-            loader_workers = max(0, min(16, int(self.loader_workers_var.get())))
-            prefetch_batches = max(1, min(16, int(self.prefetch_batches_var.get())))
+            max_workers = max(0, min(32, (os.cpu_count() or 4) - 1))
+            loader_workers = max(0, min(max_workers, int(self.loader_workers_var.get())))
+            prefetch_batches = max(1, min(512, int(self.prefetch_batches_var.get())))
+            cache_total = max(0, min(200000, int(self.dataset_cache_items_var.get())))
             dataset = APVDDataset(
-                image_paths,
-                resolution,
-                archive_entries=archive_entries,
-                video_paths=video_paths,
-                video_stride=self.video_stride_var.get(),
-                video_max_frames=self.video_max_frames_var.get(),
+                image_paths, resolution,
+                archive_entries=archive_entries, video_paths=video_paths,
+                video_stride=self.video_stride_var.get(), video_max_frames=self.video_max_frames_var.get(),
+                wavelet_mode=self._is_wavelet_mode(),
+                cache_limit=self._cache_items_per_worker(cache_total, loader_workers),
             )
-            loader_kwargs = {
-                "batch_size": batch_size,
-                "shuffle": True,
-                "num_workers": loader_workers,
-                "pin_memory": amp_enabled,
-            }
-            if loader_workers > 0:
-                loader_kwargs.update(
-                    {
-                        "persistent_workers": True,
-                        "prefetch_factor": prefetch_batches,
-                    }
-                )
-            return DataLoader(dataset, **loader_kwargs)
+            return self._build_training_dataloader(dataset, batch_size=batch_size, loader_workers=loader_workers, prefetch_batches=prefetch_batches, shuffle=True)
 
         if self.training_tensors is not None and self.training_tensors.size(0) > 0:
             tensors = self.training_tensors.detach().float()
@@ -3293,14 +3369,7 @@ Hardware Status
             messagebox.showinfo("Latent DDPM", "Latent DDPM training is already running.")
             return
 
-        epochs = simpledialog.askinteger(
-            "Train Latent DDPM",
-            "Epochs for latent diffusion training:",
-            initialvalue=10,
-            minvalue=1,
-            maxvalue=50000,
-            parent=self.root,
-        )
+        epochs = simpledialog.askinteger("Train Latent DDPM", "Epochs for latent diffusion training:", initialvalue=10, minvalue=1, maxvalue=50000, parent=self.root)
         if epochs is None:
             return
 
@@ -3323,41 +3392,22 @@ Hardware Status
             total_epochs = int(update["epochs"])
             loss = float(update["loss"])
             progress_value = min(100.0, (epoch / max(1, total_epochs)) * 100.0)
-            self._after(
-                0,
-                lambda e=epoch, t=total_epochs, l=loss, p=progress_value: (
-                    self.load_progress_var.set(p),
-                    self.status_var.set(f"Latent DDPM | Epoch {e}/{t} | Loss: {l:.5f}"),
-                ),
-            )
+            self._after(0, lambda e=epoch, t=total_epochs, l=loss, p=progress_value: (self.load_progress_var.set(p), self.status_var.set(f"Latent DDPM | Epoch {e}/{t} | Loss: {l:.5f}")))
 
         def train_job():
             try:
                 stats = train_diffusion_model(
-                    self.model,
-                    self.latent_diffusion,
-                    data_loader,
-                    epochs=int(epochs),
-                    lr=max(1e-7, min(0.1, float(self.learning_rate_var.get()))),
-                    device=self.device,
-                    progress_callback=progress,
+                    self.model, self.latent_diffusion, data_loader,
+                    epochs=int(epochs), lr=max(1e-7, min(0.1, float(self.learning_rate_var.get()))),
+                    device=self.device, progress_callback=progress
                 )
-                self._after(
-                    0,
-                    lambda s=stats: (
-                        self.status_var.set(
-                            f"Latent DDPM trained. Final loss: {float(s['final_loss']):.5f}"
-                        ),
-                        self.use_latent_diffusion_var.set(True),
-                    ),
-                )
+                self._after(0, lambda s=stats: (self.status_var.set(f"Latent DDPM trained. Final loss: {float(s['final_loss']):.5f}"), self.use_latent_diffusion_var.set(True)))
             except Exception as exc:
                 self._after(0, lambda msg=str(exc): messagebox.showerror("Latent DDPM", msg))
             finally:
                 def finish():
                     self.is_latent_diffusion_training = False
                     self.latent_diffusion_train_btn.config(state=tk.NORMAL)
-
                 self._after(0, finish)
 
         threading.Thread(target=train_job, daemon=True).start()
@@ -3366,24 +3416,11 @@ Hardware Status
         if self.latent_diffusion is None:
             messagebox.showerror("Latent DDPM", "No Latent DDPM is trained or loaded.")
             return
-        path = filedialog.asksaveasfilename(
-            title="Save Latent DDPM",
-            defaultextension=".pt",
-            initialfile="apvd_latent_ddpm.pt",
-            filetypes=self.MODEL_FILE_TYPES,
-            parent=self.root,
-        )
+        path = filedialog.asksaveasfilename(title="Save Latent DDPM", defaultextension=".pt", initialfile="apvd_latent_ddpm.pt", filetypes=self.MODEL_FILE_TYPES, parent=self.root)
         if not path:
             return
         try:
-            out = self.latent_diffusion.save(
-                path,
-                metadata={
-                    "apvd_model": str(self.loaded_model_path) if self.loaded_model_path else None,
-                    "apvd_latent_dim": self.model.latent_dim if self.model is not None else None,
-                    "saved_at": datetime.now().isoformat(timespec="seconds"),
-                },
-            )
+            out = self.latent_diffusion.save(path, metadata={"apvd_model": str(self.loaded_model_path) if self.loaded_model_path else None, "apvd_latent_dim": self.model.latent_dim if self.model is not None else None, "saved_at": datetime.now().isoformat(timespec="seconds")})
             self.loaded_latent_diffusion_path = out
             self.status_var.set(f"Saved Latent DDPM: {out.name}")
         except Exception as exc:
@@ -3393,20 +3430,13 @@ Hardware Status
         if self.model is None:
             messagebox.showerror("Latent DDPM", "Load or train an APVD model first.")
             return
-        path = filedialog.askopenfilename(
-            title="Load Latent DDPM",
-            filetypes=self.MODEL_FILE_TYPES,
-            parent=self.root,
-        )
+        path = filedialog.askopenfilename(title="Load Latent DDPM", filetypes=self.MODEL_FILE_TYPES, parent=self.root)
         if not path:
             return
         try:
             diffusion, _checkpoint = DiffusionModel.load(path, device=self.device)
             if diffusion.config.latent_dim != self.model.latent_dim:
-                raise ValueError(
-                    f"Checkpoint latent_dim={diffusion.config.latent_dim}, "
-                    f"but loaded APVD latent_dim={self.model.latent_dim}."
-                )
+                raise ValueError(f"Checkpoint latent_dim={diffusion.config.latent_dim}, but loaded APVD latent_dim={self.model.latent_dim}.")
             self.latent_diffusion = diffusion.eval()
             self.loaded_latent_diffusion_path = Path(path)
             self.latent_diffusion_timesteps_var.set(diffusion.config.timesteps)
@@ -3416,26 +3446,19 @@ Hardware Status
             messagebox.showerror("Latent DDPM", str(exc))
 
     def _select_generation_image_tensor(self) -> torch.Tensor | None:
-        path = filedialog.askopenfilename(
-            title="Select image",
-            filetypes=self.FILE_TYPES,
-            parent=self.root,
-        )
+        path = filedialog.askopenfilename(title="Select image", filetypes=self.FILE_TYPES, parent=self.root)
         if not path:
             return None
         target_size = getattr(self.model, "output_size", (self.resolution_var.get(), self.resolution_var.get()))
-        transform = transforms.Compose(
-            [
-                transforms.Resize(target_size),
-                transforms.CenterCrop(target_size),
-                transforms.ToTensor(),
-            ]
-        )
+        transform = transforms.Compose([transforms.Resize(target_size), transforms.CenterCrop(target_size), transforms.ToTensor()])
         with Image.open(path) as img:
-            return transform(img.convert("RGB")).unsqueeze(0).to(self.device)
+            tensor = transform(img.convert("RGB")).unsqueeze(0).to(self.device)
+            if self._is_wavelet_mode():
+                tensor = rgb_to_wavelet(tensor)
+            return tensor
 
     def _show_generated_tensor(self, image_tensor: torch.Tensor, latent: torch.Tensor, *, mode: str):
-        image = tensor_to_pil(image_tensor)
+        image = tensor_to_pil(self._decode_model_output_to_rgb(image_tensor))
         self._display_image(image)
         self.last_generated_latents = [latent.detach().cpu()]
         self._remember_generation(image, latent.detach().cpu(), mode=mode)
@@ -3463,13 +3486,7 @@ Hardware Status
             return
         try:
             diffusion = self._ensure_latent_diffusion()
-            output, latent = apvd_diffusion_polish(
-                self.model,
-                diffusion,
-                image_tensor,
-                strength=float(self.latent_diffusion_strength_var.get()),
-                device=self.device,
-            )
+            output, latent = apvd_diffusion_polish(self.model, diffusion, image_tensor, strength=float(self.latent_diffusion_strength_var.get()), device=self.device)
             self._show_generated_tensor(output, latent, mode="apvd_latent_ddpm_polish")
             self.status_var.set("APVD + Latent DDPM Polish generated.")
         except Exception as exc:
@@ -3482,16 +3499,11 @@ Hardware Status
         try:
             diffusion = self._ensure_latent_diffusion()
             output_count = max(1, min(8, int(self.output_count_var.get())))
-            output, latents = pure_diffusion_generation(
-                self.model,
-                diffusion,
-                batch_size=output_count,
-                device=self.device,
-            )
+            output, latents = pure_diffusion_generation(self.model, diffusion, batch_size=output_count, device=self.device)
             images = []
             self.last_generated_latents = []
             for index in range(output.size(0)):
-                image = tensor_to_pil(output[index])
+                image = tensor_to_pil(self._decode_model_output_to_rgb(output[index]))
                 images.append(image)
                 latent = latents[index : index + 1].detach().cpu()
                 self.last_generated_latents.append(latent)
@@ -3508,13 +3520,8 @@ Hardware Status
             return
         path = filedialog.askopenfilename(
             title="Select image or video to Dreamify",
-            filetypes=[
-                ("Image and video files", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.mp4 *.avi *.mov *.mkv *.webm *.m4v *.wmv"),
-                *self.IMAGE_FILE_TYPES[:-1],
-                *self.VIDEO_FILE_TYPES[:-1],
-                ("All files", "*.*"),
-            ],
-            parent=self.root,
+            filetypes=[("Image and video files", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.mp4 *.avi *.mov *.mkv *.webm *.m4v *.wmv"), *self.IMAGE_FILE_TYPES[:-1], *self.VIDEO_FILE_TYPES[:-1], ("All files", "*.*")],
+            parent=self.root
         )
         if not path:
             return
@@ -3530,13 +3537,7 @@ Hardware Status
             return
         messagebox.showerror("Dreamify Image/Video", "Select a supported image or video file.")
 
-    def _dreamify_tensor(
-        self,
-        input_tensor: torch.Tensor,
-        *,
-        dream_strength: float | None = None,
-        memory_pull: float | None = None,
-    ) -> torch.Tensor:
+    def _dreamify_tensor(self, input_tensor: torch.Tensor, *, dream_strength: float | None = None, memory_pull: float | None = None) -> torch.Tensor:
         if self.model is None:
             raise ValueError("Load or train an APVD model first.")
         self.model.eval()
@@ -3549,7 +3550,7 @@ Hardware Status
         source = input_tensor.detach().float()
         if source.ndim == 3:
             source = source.unsqueeze(0)
-        source = torch.nan_to_num(source, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0).to(self.device)
+        source = self._sanitize_model_batch(source, is_wavelet=self._model_uses_wavelet()).to(self.device)
 
         with torch.no_grad():
             mu, _logvar = self.model.encode(source)
@@ -3561,15 +3562,11 @@ Hardware Status
                 if anchor is not None:
                     latent = torch.lerp(latent, anchor.to(latent.device), memory_pull)
             output = self._decode_latent(latent, show_steps=False)
-            output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            output = self._sanitize_model_batch(output, is_wavelet=self._model_uses_wavelet())
         return output.detach().cpu()
 
     def _dreamify_memory_anchor(self, latent: torch.Tensor) -> torch.Tensor | None:
-        candidates = [
-            item.to(self.device)
-            for item in self.last_generated_latents
-            if isinstance(item, torch.Tensor) and item.numel() == latent.numel()
-        ]
+        candidates = [item.to(self.device) for item in self.last_generated_latents if isinstance(item, torch.Tensor) and item.numel() == latent.numel()]
         if candidates:
             return random.choice(candidates).reshape_as(latent)
         anchor = self._get_memory_anchor()
@@ -3626,11 +3623,10 @@ Hardware Status
         self.live_overlay_opacity_var.set(overlay_opacity)
         clickthrough_overlay = bool(self.live_clickthrough_overlay_var.get())
 
-        # Region capture: ask user for coordinates if not already stored
         if capture_mode == "Region":
             region = self._prompt_capture_region()
             if region is None:
-                return  # user cancelled
+                return 
             self._live_region = region
         else:
             self._live_region = None
@@ -3653,18 +3649,11 @@ Hardware Status
                 memory_latent = torch.randn(1, latent_dim)
 
         settings = {
-            "resolution": resolution,
-            "target_fps": target_fps,
-            "dream_strength": dream_strength,
-            "memory_pull": memory_pull,
-            "capture_mode": capture_mode,
-            "show_fps": bool(self.live_show_fps_var.get()),
-            "mini_diffusion": bool(self.live_mini_diffusion_var.get()),
-            "mini_steps": max(1, min(4, int(self.diffusion_steps_var.get()))),
-            "memory_latent": memory_latent,
-            "display_mode": display_mode,
-            "overlay_opacity": overlay_opacity,
-            "clickthrough_overlay": clickthrough_overlay,
+            "resolution": resolution, "target_fps": target_fps, "dream_strength": dream_strength,
+            "memory_pull": memory_pull, "capture_mode": capture_mode, "show_fps": bool(self.live_show_fps_var.get()),
+            "mini_diffusion": bool(self.live_mini_diffusion_var.get()), "mini_steps": max(1, min(4, int(self.diffusion_steps_var.get()))),
+            "memory_latent": memory_latent, "display_mode": display_mode, "overlay_opacity": overlay_opacity,
+            "clickthrough_overlay": clickthrough_overlay, "is_wavelet": self._is_wavelet_mode()
         }
         settings["region"] = self._live_region
         self.realtime_dreamify_settings = settings
@@ -3675,16 +3664,12 @@ Hardware Status
         elif display_mode == "Experimental Fullscreen Overlay":
             self._destroy_live_challenge_window()
             self._create_live_overlay_window(opacity=overlay_opacity, clickthrough=clickthrough_overlay)
-        else:  # Output Window
+        else: 
             self._destroy_live_overlay()
             self._destroy_live_challenge_window()
             self._create_output_window()
         self.realtime_dreamify_active = True
-        self.realtime_dreamify_thread = threading.Thread(
-            target=self._realtime_dreamify_worker,
-            args=(mss, settings),
-            daemon=True,
-        )
+        self.realtime_dreamify_thread = threading.Thread(target=self._realtime_dreamify_worker, args=(mss, settings), daemon=True)
         self.realtime_dreamify_thread.start()
         self.status_var.set(f"Real-Time Dreamify running at {target_fps} FPS")
 
@@ -3711,10 +3696,8 @@ Hardware Status
         overlay_mode = display_mode == "Experimental Fullscreen Overlay"
         challenge_mode = display_mode == "Challenge Window"
         escape_armed = not self._live_escape_is_down()
-        consecutive_black = 0  # for black-frame detection
+        consecutive_black = 0 
 
-        # On Windows, exclude the overlay window from DWM screen capture
-        # so mss never picks up our own output (experimental overlay only).
         if overlay_mode and os.name == "nt":
             self._after(0, self._exclude_overlay_from_capture)
 
@@ -3725,13 +3708,7 @@ Hardware Status
                         escape_down = self._live_escape_is_down()
                         if escape_down and escape_armed:
                             self.realtime_dreamify_active = False
-                            self._after(
-                                0,
-                                lambda: (
-                                    self._destroy_live_overlay(),
-                                    self.status_var.set("Real-Time Dreamify stopped"),
-                                ),
-                            )
+                            self._after(0, lambda: (self._destroy_live_overlay(), self.status_var.set("Real-Time Dreamify stopped")))
                             break
                         if not escape_down:
                             escape_armed = True
@@ -3739,7 +3716,11 @@ Hardware Status
                     frame_start = time.perf_counter()
                     raw_frame = self._capture_screen_frame(sct, settings)
                     input_tensor = self._live_pil_to_tensor(raw_frame)
+                    if settings.get("is_wavelet", False):
+                        input_tensor = rgb_to_wavelet(input_tensor)
                     output_tensor = self._dreamify_live_frame(input_tensor, settings)
+                    if settings.get("is_wavelet", False):
+                        output_tensor = wavelet_to_rgb(output_tensor)
                     output_image = tensor_to_pil(output_tensor)
 
                     frames_since_status += 1
@@ -3749,67 +3730,32 @@ Hardware Status
                         displayed_fps = frames_since_status / status_elapsed
                         frames_since_status = 0
                         last_status_time = now
-                        self._after(
-                            0,
-                            lambda fps=displayed_fps: self.status_var.set(
-                                f"Real-Time Dreamify running at {fps:.1f} FPS"
-                            ),
-                        )
+                        self._after(0, lambda fps=displayed_fps: self.status_var.set(f"Real-Time Dreamify running at {fps:.1f} FPS"))
 
-                    # Black-frame detection
-                    frame_arr = np.asarray(raw_frame)
-                    if frame_arr.mean() < 8.0:
+                    extrema = raw_frame.convert("L").getextrema()
+                    if extrema[1] < 8:
                         consecutive_black += 1
                     else:
                         consecutive_black = 0
                     if consecutive_black == 5:
-                        self._after(
-                            0,
-                            lambda: self.status_var.set(
-                                "Capture appears black. Try Borderless Windowed mode or Region capture."
-                            ),
-                        )
+                        self._after(0, lambda: self.status_var.set("Capture appears black. Try Borderless Windowed mode or Region capture."))
                     if overlay_mode and consecutive_black >= 20:
                         self.realtime_dreamify_active = False
-                        self._after(
-                            0,
-                            lambda: (
-                                self._destroy_live_overlay(),
-                                self.live_display_mode_var.set("Challenge Window"),
-                                messagebox.showwarning(
-                                    "Real-Time Dreamify",
-                                    "Fullscreen overlay failed or captured itself.\n\n"
-                                    "Try Challenge Window mode with Region capture instead.",
-                                ),
-                                self.status_var.set("Real-Time Dreamify stopped"),
-                            ),
-                        )
+                        self._after(0, lambda: (self._destroy_live_overlay(), self.live_display_mode_var.set("Challenge Window"), messagebox.showwarning("Real-Time Dreamify", "Fullscreen overlay failed or captured itself.\n\nTry Challenge Window mode with Region capture instead."), self.status_var.set("Real-Time Dreamify stopped")))
                         break
 
                     if challenge_mode:
                         img_copy = output_image.copy()
                         self._after(0, lambda img=img_copy: self._display_challenge_frame(img))
                     else:
-                        self._display_live_frame(
-                            output_image,
-                            raw_frame=raw_frame if overlay_mode else None,
-                            fps=displayed_fps,
-                            show_fps=bool(settings.get("show_fps", True)),
-                            settings=settings,
-                        )
+                        self._display_live_frame(output_image, raw_frame=raw_frame if overlay_mode else None, fps=displayed_fps, show_fps=bool(settings.get("show_fps", True)), settings=settings)
                     elapsed = time.perf_counter() - frame_start
                     sleep_time = frame_interval - elapsed
                     if sleep_time > 0:
                         time.sleep(sleep_time)
         except Exception as exc:
             self.realtime_dreamify_active = False
-            self._after(
-                0,
-                lambda msg=str(exc): (
-                    self.status_var.set("Real-Time Dreamify stopped"),
-                    messagebox.showerror("Real-Time Dreamify", msg),
-                ),
-            )
+            self._after(0, lambda msg=str(exc): (self.status_var.set("Real-Time Dreamify stopped"), messagebox.showerror("Real-Time Dreamify", msg)))
         finally:
             if getattr(self.device, "type", "") == "cuda":
                 torch.cuda.empty_cache()
@@ -3823,12 +3769,7 @@ Hardware Status
         if stored_region is not None:
             region = dict(stored_region)
         else:
-            region = {
-                "left": int(monitor["left"]),
-                "top": int(monitor["top"]),
-                "width": int(monitor["width"]),
-                "height": int(monitor["height"]),
-            }
+            region = {"left": int(monitor["left"]), "top": int(monitor["top"]), "width": int(monitor["width"]), "height": int(monitor["height"])}
         shot = sct.grab(region)
         frame = np.asarray(shot)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
@@ -3841,15 +3782,21 @@ Hardware Status
         return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
     def _dreamify_live_frame(self, input_tensor: torch.Tensor, settings: dict[str, object]) -> torch.Tensor:
-        if self.model is None:
-            raise ValueError("Load or train an APVD model first.")
-        model = self.model.to(self.device).eval()
+        with self.model_lock:
+            if self.model is None:
+                raise ValueError("Load or train an APVD model first.")
+            model = self.model
+            model_device = next(model.parameters()).device
+            if model_device != self.device:
+                model = model.to(self.device)
+                self.model = model
+            model.eval()
         dream_strength = max(0.0, min(2.0, float(settings.get("dream_strength", 0.25))))
         memory_pull = max(0.0, min(1.0, float(settings.get("memory_pull", 0.15))))
         source = input_tensor.detach().float()
         if source.ndim == 3:
             source = source.unsqueeze(0)
-        source = torch.nan_to_num(source, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0).to(self.device)
+        source = self._sanitize_model_batch(source, is_wavelet=bool(settings.get("is_wavelet", False))).to(self.device)
 
         with torch.no_grad():
             if hasattr(model, "encode") and hasattr(model, "decode"):
@@ -3880,18 +3827,8 @@ Hardware Status
                     for step_idx in range(steps):
                         t_value = 1.0 if steps == 1 else 1.0 - (step_idx / (steps - 1))
                         t = torch.full((latent.size(0), 1), t_value, device=latent.device)
-                        predicted_noise = torch.nan_to_num(
-                            model.predict_latent_noise(latent, t),
-                            nan=0.0,
-                            posinf=0.0,
-                            neginf=0.0,
-                        )
-                        latent = torch.nan_to_num(
-                            latent - (predicted_noise * 0.12 * t_value),
-                            nan=0.0,
-                            posinf=6.0,
-                            neginf=-6.0,
-                        ).clamp(-6.0, 6.0)
+                        predicted_noise = torch.nan_to_num(model.predict_latent_noise(latent, t), nan=0.0, posinf=0.0, neginf=0.0)
+                        latent = torch.nan_to_num(latent - (predicted_noise * 0.12 * t_value), nan=0.0, posinf=6.0, neginf=-6.0).clamp(-6.0, 6.0)
 
                 output = model.decode(latent) if hasattr(model, "decode") else fallback_output
             else:
@@ -3899,18 +3836,10 @@ Hardware Status
 
             if output is None:
                 raise ValueError("The loaded model did not return a reconstructable output.")
-            output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            output = self._sanitize_model_batch(output, is_wavelet=bool(settings.get("is_wavelet", False)))
         return output.detach().cpu()
 
-    def _display_live_frame(
-        self,
-        pil_img: Image.Image,
-        *,
-        raw_frame: Image.Image | None = None,
-        fps: float | None = None,
-        show_fps: bool = True,
-        settings: dict[str, object] | None = None,
-    ):
+    def _display_live_frame(self, pil_img: Image.Image, *, raw_frame: Image.Image | None = None, fps: float | None = None, show_fps: bool = True, settings: dict[str, object] | None = None):
         if self._closing:
             return
         image = pil_img.convert("RGB")
@@ -3932,12 +3861,7 @@ Hardware Status
             if self._closing:
                 return
             if settings is not None and settings.get("display_mode") == "Experimental Fullscreen Overlay":
-                self._display_live_overlay_image(
-                    image,
-                    raw_frame=raw_frame,
-                    opacity=float(settings.get("overlay_opacity", 0.85)),
-                    clickthrough=bool(settings.get("clickthrough_overlay", True)),
-                )
+                self._display_live_overlay_image(image, raw_frame=raw_frame, opacity=float(settings.get("overlay_opacity", 0.85)), clickthrough=bool(settings.get("clickthrough_overlay", True)))
                 return
             if self.output_window is None:
                 self._create_output_window()
@@ -3945,29 +3869,8 @@ Hardware Status
 
         self._after(0, show)
 
-    def _display_live_overlay_image(
-        self,
-        image: Image.Image,
-        *,
-        raw_frame: Image.Image | None = None,
-        opacity: float,
-        clickthrough: bool,
-    ):
-        """Render the dreamified frame into the fullscreen overlay.
-
-        The overlay window is shown at full opacity (alpha=1.0) and the
-        per-pixel blend between the raw desktop capture and the VAE output
-        is done in software here, so the window never flickers from alpha
-        toggling.  The window-level alpha attribute is only written once at
-        creation time; we don't touch it every frame.
-
-        If raw_frame is provided the final pixel is:
-            result = lerp(raw_frame, vae_output, overlay_opacity)
-        This gives a true "filter on top of the desktop" look: at opacity 0
-        you see the raw desktop, at 1.0 you see pure VAE dreamified output.
-        """
+    def _display_live_overlay_image(self, image: Image.Image, *, raw_frame: Image.Image | None = None, opacity: float, clickthrough: bool):
         from PIL import ImageTk
-
         if self.live_overlay_window is None or self.live_overlay_canvas is None:
             self._create_live_overlay_window(opacity=1.0, clickthrough=clickthrough)
         win = self.live_overlay_window
@@ -3986,8 +3889,6 @@ Hardware Status
             vae_out = image.resize((width, height), Image.Resampling.BILINEAR).convert("RGB")
 
             if raw_frame is not None:
-                # Software blend: composite VAE output over the raw desktop frame.
-                # opacity=1.0 → pure VAE; opacity=0.0 → pure desktop passthrough.
                 bg = raw_frame.resize((width, height), Image.Resampling.BILINEAR).convert("RGB")
                 blend_alpha = max(0.0, min(1.0, float(opacity)))
                 fitted = Image.blend(bg, vae_out, blend_alpha)
@@ -4003,13 +3904,13 @@ Hardware Status
             self._live_overlay_photo = None
 
     def _dreamify_image_file(self, path: Path):
-        output_dir = Path("Dreamify_Output")
+        output_dir = DREAMIFY_OUTPUT_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
         with Image.open(path) as img:
             image = img.convert("RGB")
         input_tensor = self._pil_to_apvd_tensor(image)
         output_tensor = self._dreamify_tensor(input_tensor)
-        output_image = tensor_to_pil(output_tensor)
+        output_image = tensor_to_pil(self._decode_model_output_to_rgb(output_tensor))
         out_path = output_dir / f"dreamify_{path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         output_image.save(out_path)
         self._display_image(output_image)
@@ -4039,52 +3940,19 @@ Hardware Status
 
         controls = ttk.Frame(body, style="Surface.TFrame")
         controls.pack(fill=tk.X)
-        dream_scale = self._register_theme_widget(
-            tk.Scale(
-                controls,
-                from_=0.0,
-                to=2.0,
-                resolution=0.05,
-                orient=tk.HORIZONTAL,
-                length=300,
-                variable=dream_strength_var,
-            ),
-            "scale",
-        )
+        dream_scale = self._register_theme_widget(tk.Scale(controls, from_=0.0, to=2.0, resolution=0.05, orient=tk.HORIZONTAL, length=300, variable=dream_strength_var), "scale")
         self._grid_row(controls, 0, "Dream Strength:", dream_scale)
-        memory_scale = self._register_theme_widget(
-            tk.Scale(
-                controls,
-                from_=0.0,
-                to=1.0,
-                resolution=0.05,
-                orient=tk.HORIZONTAL,
-                length=300,
-                variable=memory_pull_var,
-            ),
-            "scale",
-        )
+        memory_scale = self._register_theme_widget(tk.Scale(controls, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=300, variable=memory_pull_var), "scale")
         self._grid_row(controls, 1, "Memory Pull:", memory_scale)
         frame_skip_spin = ttk.Spinbox(controls, from_=1, to=30, increment=1, width=6, textvariable=frame_skip_var)
         self._grid_row(controls, 2, "Frame Skip:", frame_skip_spin)
-        ttk.Checkbutton(controls, text="Keep Original Audio", variable=keep_audio_var).grid(
-            row=2,
-            column=2,
-            sticky=tk.W,
-            padx=(0, 18),
-            pady=4,
-        )
+        ttk.Checkbutton(controls, text="Keep Original Audio", variable=keep_audio_var).grid(row=2, column=2, sticky=tk.W, padx=(0, 18), pady=4)
 
         buttons = ttk.Frame(body, style="Surface.TFrame")
         buttons.pack(fill=tk.X, pady=(12, 0))
 
         def current_settings() -> tuple[float, float, int, bool]:
-            return (
-                max(0.0, min(2.0, float(dream_strength_var.get()))),
-                max(0.0, min(1.0, float(memory_pull_var.get()))),
-                max(1, min(30, int(frame_skip_var.get()))),
-                bool(keep_audio_var.get()),
-            )
+            return (max(0.0, min(2.0, float(dream_strength_var.get()))), max(0.0, min(1.0, float(memory_pull_var.get()))), max(1, min(30, int(frame_skip_var.get()))), bool(keep_audio_var.get()))
 
         def apply_settings():
             dream_strength, memory_pull, frame_skip, keep_audio = current_settings()
@@ -4118,7 +3986,6 @@ Hardware Status
                     if not win.winfo_exists():
                         return
                     from PIL import ImageTk
-
                     display = image.copy()
                     display.thumbnail((700, 360), Image.Resampling.LANCZOS)
                     state["photo"] = ImageTk.PhotoImage(display, master=win)
@@ -4137,17 +4004,7 @@ Hardware Status
             dream_strength, memory_pull, frame_skip, keep_audio = apply_settings()
             win.destroy()
             self.status_var.set(f"Dreamifying video: {path.name}")
-            threading.Thread(
-                target=self._dreamify_video_file,
-                args=(path,),
-                kwargs={
-                    "dream_strength": dream_strength,
-                    "memory_pull": memory_pull,
-                    "frame_skip": frame_skip,
-                    "keep_audio": keep_audio,
-                },
-                daemon=True,
-            ).start()
+            threading.Thread(target=self._dreamify_video_file, args=(path,), kwargs={"dream_strength": dream_strength, "memory_pull": memory_pull, "frame_skip": frame_skip, "keep_audio": keep_audio}, daemon=True).start()
 
         refresh_btn = ttk.Button(buttons, text="Refresh Preview", command=refresh_preview)
         refresh_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -4176,26 +4033,14 @@ Hardware Status
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         source_image = Image.fromarray(np.ascontiguousarray(rgb)).convert("RGB")
-        output_tensor = self._dreamify_tensor(
-            self._pil_to_apvd_tensor(source_image),
-            dream_strength=dream_strength,
-            memory_pull=memory_pull,
-        )
-        output_image = tensor_to_pil(output_tensor).resize(source_image.size, Image.Resampling.LANCZOS)
+        output_tensor = self._dreamify_tensor(self._pil_to_apvd_tensor(source_image), dream_strength=dream_strength, memory_pull=memory_pull)
+        output_image = tensor_to_pil(self._decode_model_output_to_rgb(output_tensor)).resize(source_image.size, Image.Resampling.LANCZOS)
         return self._compose_side_by_side([source_image, output_image])
 
-    def _dreamify_video_file(
-        self,
-        path: Path,
-        *,
-        dream_strength: float | None = None,
-        memory_pull: float | None = None,
-        frame_skip: int | None = None,
-        keep_audio: bool | None = None,
-    ):
-        output_dir = Path("Dreamify_Output")
+    def _dreamify_video_file(self, path: Path, *, dream_strength: float | None = None, memory_pull: float | None = None, frame_skip: int | None = None, keep_audio: bool | None = None):
+        output_dir = DREAMIFY_OUTPUT_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_path = output_dir / f"dreamify_{path.stem}_{timestamp}.mp4"
         video_only_path = output_path
         if keep_audio is None:
@@ -4219,12 +4064,7 @@ Hardware Status
             if frame_skip is None:
                 frame_skip = int(self.dreamify_frame_skip_var.get())
             frame_skip = max(1, min(30, int(frame_skip)))
-            writer = cv2.VideoWriter(
-                str(video_only_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                fps,
-                (width, height),
-            )
+            writer = cv2.VideoWriter(str(video_only_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             if not writer.isOpened():
                 raise ValueError(f"Could not create video writer:\n{video_only_path}")
 
@@ -4238,11 +4078,7 @@ Hardware Status
                     if frame_index % frame_skip == 0 or last_output is None:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         pil = Image.fromarray(np.ascontiguousarray(rgb)).convert("RGB")
-                        output_tensor = self._dreamify_tensor(
-                            self._pil_to_apvd_tensor(pil),
-                            dream_strength=dream_strength,
-                            memory_pull=memory_pull,
-                        )
+                        output_tensor = self._dreamify_tensor(self._pil_to_apvd_tensor(pil), dream_strength=dream_strength, memory_pull=memory_pull)
                         last_output = self._tensor_to_cv_frame(output_tensor, size=(width, height))
                     if last_output is not None:
                         writer.write(last_output)
@@ -4282,24 +4118,7 @@ Hardware Status
             except Exception:
                 return video_only_path
             return output_path
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(video_only_path),
-            "-i",
-            str(source_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a?",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(output_path),
-        ]
+        cmd = [ffmpeg, "-y", "-i", str(video_only_path), "-i", str(source_path), "-map", "0:v:0", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac", "-shortest", str(output_path)]
         try:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             video_only_path.unlink(missing_ok=True)
@@ -4308,46 +4127,266 @@ Hardware Status
             return video_only_path
 
     def _pil_to_apvd_tensor(self, image: Image.Image) -> torch.Tensor:
-        target_size = getattr(self.model, "output_size", (self.resolution_var.get(), self.resolution_var.get()))
-        transform = transforms.Compose(
-            [
-                transforms.Resize(target_size, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.ToTensor(),
-            ]
-        )
-        return transform(image.convert("RGB")).unsqueeze(0)
+        target_size = self._model_rgb_input_size()
+        transform = transforms.Compose([transforms.Resize(target_size, interpolation=transforms.InterpolationMode.BICUBIC), transforms.ToTensor()])
+        tensor = transform(image.convert("RGB")).unsqueeze(0)
+        if self._model_uses_wavelet():
+            tensor = rgb_to_wavelet(tensor)
+        return tensor
 
     def _tensor_to_cv_frame(self, tensor: torch.Tensor, *, size: tuple[int, int]) -> np.ndarray:
-        image = tensor_to_pil(tensor).resize(size, Image.Resampling.LANCZOS)
+        image = tensor_to_pil(self._decode_model_output_to_rgb(tensor)).resize(size, Image.Resampling.LANCZOS)
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         return cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
 
     def _make_initial_dream_latent(self) -> torch.Tensor:
         if self.model is None:
             raise ValueError("Load or train an APVD model first.")
-
         latent_dim = int(self.model.latent_dim)
         for latent in self.last_generated_latents:
             if isinstance(latent, torch.Tensor) and latent.numel() == latent_dim:
                 return latent.detach().float().reshape(1, latent_dim).cpu()
-
         memory_anchor = self._get_memory_anchor()
         if isinstance(memory_anchor, torch.Tensor) and memory_anchor.numel() == latent_dim:
             return memory_anchor.detach().float().reshape(1, latent_dim).cpu()
-
         return self._get_random_latent().detach().float().reshape(1, latent_dim).cpu()
 
-    def _decode_latent_to_pil(self, latent: torch.Tensor, *, output_size: tuple[int, int]) -> Image.Image:
+    def _decode_latent_to_pil(self, latent: torch.Tensor, *, output_size: tuple[int, int], refined: bool = True) -> Image.Image:
         if self.model is None:
             raise ValueError("Load or train an APVD model first.")
         latent = latent.to(self.device)
-        image_tensor = self.model.decode(latent)
-        return tensor_to_pil(image_tensor).resize(output_size, Image.Resampling.LANCZOS)
+        if refined:
+            image_tensor = self._decode_latent(latent, show_steps=False)
+        else:
+            image_tensor = self.model.decode(latent)
+        return tensor_to_pil(self._decode_model_output_to_rgb(image_tensor)).resize(output_size, Image.Resampling.LANCZOS)
+
+    def _refine_dream_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if self.model is None:
+            raise ValueError("Load or train an APVD model first.")
+        current = latent.detach().float().reshape(1, -1).to(self.device)
+        with torch.no_grad():
+            if self.use_latent_diffusion_var.get() and self.latent_diffusion is not None:
+                diffusion = self._ensure_latent_diffusion()
+                current = diffusion.polish_latent(current, strength=max(0.0, min(1.0, float(self.latent_diffusion_strength_var.get()))))
+            if self.use_mini_diffusion_var.get() and hasattr(self.model, "predict_latent_noise"):
+                current = self._mini_diffusion_refine(current, show_steps=False)
+            current = torch.nan_to_num(current, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        return current
 
     def _pil_to_cv_frame(self, image: Image.Image, *, size: tuple[int, int]) -> np.ndarray:
         resized = image.convert("RGB").resize(size, Image.Resampling.LANCZOS)
         rgb = np.asarray(resized, dtype=np.uint8)
         return cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
+
+    def _select_dream_audio_source(self):
+        path = filedialog.askopenfilename(title="Select audio or video source for Dream Continuation", filetypes=[("Audio / Video", "*.mp3 *.wav *.ogg *.m4a *.aac *.flac *.mp4 *.mov *.mkv *.avi *.webm"), ("All files", "*.*")], parent=self.root)
+        if path:
+            self.dream_video_audio_source_var.set(path)
+            self.status_var.set(f"Dream audio source selected: {Path(path).name}")
+
+    def _select_dream_structure_video(self):
+        path = filedialog.askopenfilename(title="Select source video for Dream Continuation structure", filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v *.wmv"), ("All files", "*.*")], parent=self.root)
+        if path:
+            self.dream_structure_video_source_var.set(path)
+            if not self.dream_video_audio_source_var.get().strip():
+                self.dream_video_audio_source_var.set(path)
+            self.status_var.set(f"Dream structure video selected: {Path(path).name}")
+
+    def _pil_to_model_tensor(self, image: Image.Image, *, resolution: int) -> torch.Tensor:
+        image = image.convert("RGB").resize((int(resolution), int(resolution)), Image.Resampling.LANCZOS)
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous().unsqueeze(0)
+        # Convert RGB to Wavelet representation if needed
+        if self.model is not None and self.model.in_channels == 12:
+            tensor = rgb_to_wavelet(tensor)
+        return tensor.to(self.device)
+
+    def _encode_pil_to_latent(self, image: Image.Image, *, resolution: int) -> torch.Tensor:
+        if self.model is None:
+            raise ValueError("Load or train an APVD model first.")
+        tensor = self._pil_to_model_tensor(image, resolution=resolution)
+        with torch.no_grad():
+            mu, _logvar = self.model.encode(tensor)
+        return torch.nan_to_num(mu.detach().float(), nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+
+    def _load_dream_structure_latents(self, video_path: Path | None, *, resolution: int, max_anchors: int = 72) -> list[torch.Tensor]:
+        if video_path is None or not Path(video_path).exists():
+            return []
+        if self.model is None:
+            raise ValueError("Load or train an APVD model first.")
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"Could not open structure video:\n{video_path}")
+        try:
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_count <= 0:
+                return []
+            anchor_count = max(4, min(int(max_anchors), frame_count))
+            indices = np.linspace(0, max(0, frame_count - 1), anchor_count, dtype=np.int64)
+            latents: list[torch.Tensor] = []
+            last_frame = None
+            for frame_index in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                small = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_AREA)
+                if last_frame is not None:
+                    delta = float(np.mean(cv2.absdiff(small, last_frame)))
+                    if delta < 1.5 and len(latents) > 4:
+                        continue
+                last_frame = small
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(np.ascontiguousarray(rgb)).convert("RGB")
+                latents.append(self._encode_pil_to_latent(image, resolution=resolution).detach().cpu())
+            if len(latents) < 2:
+                return latents
+            stack = torch.cat([z.reshape(1, -1) for z in latents], dim=0)
+            common = stack.mean(dim=0, keepdim=True)
+            generalized = []
+            previous = None
+            for z in latents:
+                z = z.reshape(1, -1)
+                z = torch.lerp(z, common, 0.28)
+                if previous is not None:
+                    z = torch.lerp(z, previous, 0.35)
+                generalized.append(torch.nan_to_num(z, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0))
+                previous = generalized[-1]
+            return generalized
+        finally:
+            cap.release()
+
+    def _interpolate_structure_anchor(self, anchors: list[torch.Tensor], timeline_t: float) -> torch.Tensor | None:
+        if not anchors:
+            return None
+        if len(anchors) == 1:
+            return anchors[0].detach().float().reshape(1, -1).to(self.device)
+        timeline_t = max(0.0, min(1.0, float(timeline_t)))
+        position = timeline_t * (len(anchors) - 1)
+        idx = int(math.floor(position))
+        idx2 = min(len(anchors) - 1, idx + 1)
+        local_t = position - idx
+        local_t = local_t * local_t * (3.0 - (2.0 * local_t))
+        a = anchors[idx].detach().float().reshape(1, -1).to(self.device)
+        b = anchors[idx2].detach().float().reshape(1, -1).to(self.device)
+        if torch.norm(a).item() > 1e-6 and torch.norm(b).item() > 1e-6:
+            return slerp(local_t, a, b)
+        return torch.lerp(a, b, local_t)
+
+    def _make_dream_scene_target(self, current_latent: torch.Tensor, *, drift: float, instability: float) -> torch.Tensor:
+        if self.model is None:
+            raise ValueError("Load or train an APVD model first.")
+        latent_dim = int(self.model.latent_dim)
+        anchor = None
+        try:
+            anchor = self._get_memory_anchor()
+        except Exception:
+            anchor = None
+        if anchor is None:
+            try:
+                anchor = self._get_blended_anchor(max(2, min(6, int(self.blend_count_var.get()))))
+            except Exception:
+                anchor = None
+        if anchor is None:
+            try:
+                anchor = self._get_random_latent()
+            except Exception:
+                anchor = None
+        if not isinstance(anchor, torch.Tensor) or anchor.numel() != latent_dim:
+            anchor = torch.randn(1, latent_dim, device=self.device)
+        anchor = anchor.detach().float().reshape(1, latent_dim).to(self.device)
+        current_latent = current_latent.detach().float().reshape(1, latent_dim).to(self.device)
+        continuity = max(0.35, min(0.92, 1.0 - (float(drift) * 0.22)))
+        target = torch.lerp(anchor, current_latent, continuity)
+        noise_amount = (0.04 + float(drift) * 0.10 + float(instability) * 0.055)
+        target = target + (torch.randn_like(target) * noise_amount)
+        return torch.nan_to_num(target, nan=0.0, posinf=8.0, neginf=-8.0).clamp(-8.0, 8.0)
+
+    def _apply_autoregressive_dream_feedback(
+        self,
+        generated_image: Image.Image,
+        predicted_next_latent: torch.Tensor,
+        *,
+        resolution: int,
+        feedback_strength: float,
+        structure_guidance: float = 0.0,
+        has_structure_anchors: bool = False,
+    ) -> torch.Tensor:
+        """Use the generated frame as the next-frame input, similar to autoregressive video generation.
+
+        APVD still moves through latent memory, but this feedback step makes the next
+        frame continue from what the decoder actually drew instead of only from the
+        planned latent target. Structure-guided videos get a slightly lower feedback
+        mix so source-video anchors do not get overwritten too quickly.
+        """
+        mix = max(0.0, min(1.0, float(feedback_strength)))
+        if mix <= 0.0:
+            return predicted_next_latent
+
+        feedback_latent = self._encode_pil_to_latent(generated_image, resolution=resolution)
+        feedback_latent = feedback_latent.detach().float().reshape_as(predicted_next_latent).to(self.device)
+        if has_structure_anchors:
+            mix *= max(0.20, 1.0 - (float(structure_guidance) * 0.55))
+
+        if torch.norm(predicted_next_latent).item() > 1e-6 and torch.norm(feedback_latent).item() > 1e-6:
+            updated = slerp(mix, predicted_next_latent, feedback_latent)
+        else:
+            updated = torch.lerp(predicted_next_latent, feedback_latent, mix)
+        return torch.nan_to_num(updated, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+
+    def _write_procedural_dream_audio(self, output_path: Path, *, seconds: float, seed: int = 1337) -> Path:
+        import wave
+        rng = random.Random(seed)
+        sample_rate = 44100
+        total = max(1, int(float(seconds) * sample_rate))
+        t = np.linspace(0.0, float(seconds), total, endpoint=False, dtype=np.float32)
+        base = rng.choice([55.0, 65.41, 73.42, 82.41, 98.0])
+        signal = np.zeros_like(t)
+        for i, mult in enumerate([1.0, 1.5, 2.0, 2.5, 3.0]):
+            wobble = 0.7 + (0.35 * np.sin(2.0 * np.pi * (0.03 + i * 0.017) * t))
+            signal += (0.13 / (i + 1)) * np.sin(2.0 * np.pi * base * mult * wobble * t)
+        pulse = 0.5 + 0.5 * np.sin(2.0 * np.pi * 0.45 * t)
+        hiss = np.random.default_rng(seed).normal(0.0, 0.018, total).astype(np.float32)
+        signal = (signal * (0.45 + pulse * 0.35)) + hiss
+        fade_len = min(total // 4, int(sample_rate * 1.5))
+        if fade_len > 0:
+            fade = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+            signal[:fade_len] *= fade
+            signal[-fade_len:] *= fade[::-1]
+        signal = np.clip(signal, -0.95, 0.95)
+        pcm = (signal * 32767.0).astype(np.int16)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(output_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+        return output_path
+
+    def _mux_audio_into_video(self, video_only_path: Path, output_path: Path, audio_path: Path | None) -> tuple[Path, bool]:
+        if audio_path is None or not Path(audio_path).exists():
+            if video_only_path != output_path:
+                try:
+                    video_only_path.replace(output_path)
+                except Exception:
+                    return video_only_path, False
+            return output_path, False
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            if video_only_path != output_path:
+                try:
+                    video_only_path.replace(output_path)
+                except Exception:
+                    return video_only_path, False
+            return output_path, False
+        cmd = [ffmpeg, "-y", "-i", str(video_only_path), "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-shortest", str(output_path)]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            video_only_path.unlink(missing_ok=True)
+            return output_path, True
+        except Exception:
+            return video_only_path, False
 
     def _generate_dream_continuation_video(self):
         if self.model is None:
@@ -4359,12 +4398,28 @@ Hardware Status
 
         try:
             initial_latent = self._make_initial_dream_latent()
-            seconds = max(1, min(30, int(self.dream_video_seconds_var.get())))
+            seconds = max(1, min(180, int(self.dream_video_seconds_var.get())))
             fps = max(4, min(30, int(self.dream_video_fps_var.get())))
             latent_drift = max(0.0, min(2.0, float(self.latent_drift_var.get())))
             motion_smoothness = max(0.0, min(0.99, float(self.motion_smoothness_var.get())))
             dream_instability = max(0.0, min(1.5, float(self.dream_instability_var.get())))
             resolution = max(32, min(1024, int(self.resolution_var.get())))
+            audio_mode = self.dream_video_audio_mode_var.get()
+            audio_source = Path(self.dream_video_audio_source_var.get()) if self.dream_video_audio_source_var.get().strip() else None
+            structure_video = Path(self.dream_structure_video_source_var.get()) if self.dream_structure_video_source_var.get().strip() else None
+            structure_guidance = max(0.0, min(1.0, float(self.dream_structure_guidance_var.get())))
+            autoregressive_feedback = bool(self.dream_autoregressive_var.get())
+            feedback_strength = max(0.0, min(1.0, float(self.dream_feedback_strength_var.get())))
+            if audio_mode == "Use Source Video Audio" and audio_source is None and structure_video is not None:
+                audio_source = structure_video
+            if audio_mode == "Use Source Video Audio" and audio_source is None and self.video_paths:
+                audio_source = Path(self.video_paths[0])
+            if audio_mode == "Use Source Video Audio" and audio_source is None:
+                selected = filedialog.askopenfilename(title="Select a video/audio file for Dream Continuation audio", filetypes=[("Audio / Video", "*.mp3 *.wav *.ogg *.m4a *.aac *.flac *.mp4 *.mov *.mkv *.avi *.webm"), ("All files", "*.*")], parent=self.root)
+                if not selected:
+                    return
+                audio_source = Path(selected)
+                self.dream_video_audio_source_var.set(str(audio_source))
         except Exception as exc:
             messagebox.showerror("Dream Continuation Video", str(exc))
             return
@@ -4374,41 +4429,31 @@ Hardware Status
         self.latent_drift_var.set(latent_drift)
         self.motion_smoothness_var.set(motion_smoothness)
         self.dream_instability_var.set(dream_instability)
+        self.dream_structure_guidance_var.set(structure_guidance)
+        self.dream_autoregressive_var.set(autoregressive_feedback)
+        self.dream_feedback_strength_var.set(feedback_strength)
         self.resolution_var.set(resolution)
         self.is_dream_video_generating = True
         self.status_var.set("Generating dream video: 0%")
 
-        threading.Thread(
-            target=self._generate_dream_video_worker,
-            kwargs={
-                "initial_latent": initial_latent,
-                "seconds": seconds,
-                "fps": fps,
-                "latent_drift": latent_drift,
-                "motion_smoothness": motion_smoothness,
-                "dream_instability": dream_instability,
-                "resolution": resolution,
-            },
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._generate_dream_video_worker, kwargs={
+            "initial_latent": initial_latent, "seconds": seconds, "fps": fps, "latent_drift": latent_drift,
+            "motion_smoothness": motion_smoothness, "dream_instability": dream_instability, "resolution": resolution,
+            "audio_mode": audio_mode, "audio_source": audio_source, "structure_video": structure_video, "structure_guidance": structure_guidance,
+            "autoregressive_feedback": autoregressive_feedback, "feedback_strength": feedback_strength
+        }, daemon=True).start()
 
-    def _generate_dream_video_worker(
-        self,
-        *,
-        initial_latent: torch.Tensor,
-        seconds: int,
-        fps: int,
-        latent_drift: float,
-        motion_smoothness: float,
-        dream_instability: float,
-        resolution: int,
-    ) -> None:
-        output_dir = Path("Dream_Videos")
+    def _generate_dream_video_worker(self, *, initial_latent: torch.Tensor, seconds: int, fps: int, latent_drift: float, motion_smoothness: float, dream_instability: float, resolution: int, audio_mode: str = "Silent", audio_source: Path | None = None, structure_video: Path | None = None, structure_guidance: float = 0.0, autoregressive_feedback: bool = True, feedback_strength: float = 0.35) -> None:
+        output_dir = DREAM_VIDEOS_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"dream_continuation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_path = output_dir / f"dream_continuation_{timestamp}.mp4"
+        video_only_path = output_dir / f"dream_continuation_{timestamp}_video_only.mp4"
+        temp_audio_path = output_dir / f"dream_continuation_{timestamp}_procedural.wav"
         writer = None
         final_image: Image.Image | None = None
         final_latent: torch.Tensor | None = None
+        audio_included = False
 
         try:
             if self.model is None:
@@ -4417,12 +4462,7 @@ Hardware Status
             self.model.to(self.device).eval()
             total_frames = max(1, int(seconds) * int(fps))
             size = (int(resolution), int(resolution))
-            writer = cv2.VideoWriter(
-                str(output_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                float(fps),
-                size,
-            )
+            writer = cv2.VideoWriter(str(video_only_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), size)
             if not writer.isOpened():
                 raise ValueError(f"Could not create video writer:\n{output_path}")
 
@@ -4431,50 +4471,86 @@ Hardware Status
             if latent.size(1) != latent_dim:
                 raise ValueError(f"Dream latent has {latent.size(1)} dims, but APVD uses {latent_dim}.")
 
-            alpha = max(0.01, min(1.0, 1.0 - float(motion_smoothness)))
-            target_scale = float(latent_drift)
-            target_latent = latent + (torch.randn_like(latent) * target_scale)
-            segment_frames = max(4, int(fps * (0.75 + motion_smoothness * 2.0)))
+            structure_anchors = self._load_dream_structure_latents(structure_video, resolution=resolution, max_anchors=max(8, min(96, total_frames // max(1, fps // 2)))) if structure_video is not None and structure_guidance > 0.0 else []
+            if structure_anchors:
+                self._after(0, lambda n=len(structure_anchors): self.status_var.set(f"Loaded {n} structure anchors from source video."))
+                first_anchor = structure_anchors[0].reshape(1, -1).to(self.device)
+                latent = torch.lerp(latent, first_anchor, min(0.85, structure_guidance * 0.75))
+                latent = self._refine_dream_latent(latent)
+
+            alpha = max(0.02, min(0.65, 1.0 - float(motion_smoothness)))
+            if structure_anchors:
+                alpha = max(alpha, 0.10 + (structure_guidance * 0.22))
+            segment_frames = max(6, int(fps * (1.0 + motion_smoothness * 3.0)))
             progress_stride = max(1, int(fps / 2))
             preview_stride = max(1, int(fps))
+            target_latent = self._make_dream_scene_target(latent, drift=latent_drift, instability=dream_instability)
+            velocity = torch.zeros_like(latent)
 
             with torch.no_grad():
                 for frame_index in range(total_frames):
-                    image = self._decode_latent_to_pil(latent, output_size=size)
+                    render_latent = self._refine_dream_latent(latent)
+                    image = self._decode_latent_to_pil(render_latent, output_size=size, refined=True)
                     writer.write(self._pil_to_cv_frame(image, size=size))
                     final_image = image
 
                     if frame_index == 0 or frame_index == total_frames - 1 or frame_index % progress_stride == 0:
                         pct = min(100, int(((frame_index + 1) / total_frames) * 100))
-                        self._after(0, lambda p=pct: self.status_var.set(f"Generating dream video: {p}%"))
+                        label = "structure-guided" if structure_anchors else "memory-guided"
+                        if autoregressive_feedback and feedback_strength > 0.0:
+                            label += " autoregressive"
+                        self._after(0, lambda p=pct, l=label: self.status_var.set(f"Generating dream continuation ({l}): {p}%"))
                     if frame_index == 0 or frame_index == total_frames - 1 or frame_index % preview_stride == 0:
                         self._after(0, lambda img=image.copy(): self._display_image(img))
 
-                    if (frame_index + 1) % segment_frames == 0:
-                        target_latent = latent + (torch.randn_like(latent) * target_scale)
+                    timeline_t = (frame_index + 1) / max(1, total_frames - 1)
+                    if structure_anchors:
+                        source_target = self._interpolate_structure_anchor(structure_anchors, timeline_t)
+                        memory_target = target_latent
+                        if frame_index > 0 and frame_index % segment_frames == 0:
+                            memory_target = self._make_dream_scene_target(latent, drift=latent_drift * 0.5, instability=dream_instability * 0.35)
+                            target_latent = memory_target
+                        target_latent = torch.lerp(memory_target, source_target, structure_guidance)
+                    elif frame_index > 0 and frame_index % segment_frames == 0:
+                        target_latent = self._make_dream_scene_target(latent, drift=latent_drift, instability=dream_instability)
                     else:
-                        target_latent = target_latent + (torch.randn_like(target_latent) * target_scale * 0.03)
+                        target_latent = target_latent + (torch.randn_like(target_latent) * float(latent_drift) * 0.0025)
 
                     if torch.norm(latent).item() > 1e-6 and torch.norm(target_latent).item() > 1e-6:
-                        next_latent = slerp(alpha, latent, target_latent)
+                        guided = slerp(alpha, latent, target_latent)
                     else:
-                        next_latent = torch.lerp(latent, target_latent, alpha)
+                        guided = torch.lerp(latent, target_latent, alpha)
+
+                    velocity = (velocity * float(motion_smoothness)) + ((guided - latent) * (1.0 - float(motion_smoothness)))
+                    next_latent = latent + velocity
 
                     if dream_instability > 0.0:
-                        next_latent = next_latent + (torch.randn_like(next_latent) * dream_instability * 0.035)
+                        noise_scale = dream_instability * (0.004 if structure_anchors else 0.009)
+                        next_latent = next_latent + (torch.randn_like(next_latent) * noise_scale)
 
-                    latent = torch.nan_to_num(next_latent, nan=0.0, posinf=8.0, neginf=-8.0).clamp(-8.0, 8.0)
+                    next_latent = torch.nan_to_num(next_latent, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+                    if autoregressive_feedback and feedback_strength > 0.0:
+                        next_latent = self._apply_autoregressive_dream_feedback(
+                            image,
+                            next_latent,
+                            resolution=resolution,
+                            feedback_strength=feedback_strength,
+                            structure_guidance=structure_guidance,
+                            has_structure_anchors=bool(structure_anchors),
+                        )
 
-            final_latent = latent.detach().cpu()
+                    latent = torch.nan_to_num(next_latent, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+
+            final_latent = self._refine_dream_latent(latent).detach().cpu()
+
+            mux_audio_path = None
+            if audio_mode == "Use Source Video Audio" and audio_source is not None:
+                mux_audio_path = Path(audio_source)
+            elif audio_mode == "Procedural Dream Audio":
+                mux_audio_path = self._write_procedural_dream_audio(temp_audio_path, seconds=total_frames / float(fps), seed=int(time.time()) % 999999)
+            output_path, audio_included = self._mux_audio_into_video(video_only_path, output_path, mux_audio_path)
         except Exception as exc:
-            self._after(
-                0,
-                lambda msg=str(exc): (
-                    setattr(self, "is_dream_video_generating", False),
-                    self.status_var.set("Dream video export failed."),
-                    messagebox.showerror("Dream Continuation Video", msg),
-                ),
-            )
+            self._after(0, lambda msg=str(exc): (setattr(self, "is_dream_video_generating", False), self.status_var.set("Dream video export failed."), messagebox.showerror("Dream Continuation Video", msg)))
             return
         finally:
             if writer is not None:
@@ -4504,88 +4580,70 @@ Hardware Status
         return path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
 
     def _auto_load_model(self):
-        models_folder = Path("Models")
+        models_folder = MODELS_DIR
         if not models_folder.exists():
             messagebox.showerror("Error", f"Model folder not found:\n{models_folder.resolve()}")
             return
-
-        prompt = simpledialog.askstring(
-            "Auto Load Model",
-            "Enter a prompt, folder name, or nested category path (for example Games or Food):",
-            parent=self.root,
-        )
+        prompt = simpledialog.askstring("Auto Load Model", "Enter a prompt, folder name, or nested category path:", parent=self.root)
         if prompt is None:
             return
-
         try:
             best_model_path, selection_reason = select_model_path_for_prompt(models_folder, prompt)
-            print(f"Selected model: {best_model_path.name} ({selection_reason})")
             self.generation_prompt_var.set(prompt.strip())
             self._load_model_file(best_model_path)
-            self.status_var.set(
-                f"Selected model: {best_model_path.name} ({selection_reason})"
-            )
+            self.status_var.set(f"Selected model: {best_model_path.name} ({selection_reason})")
             self._generate_image(self.model)
         except Exception as exc:
             messagebox.showerror("Auto Load Model", str(exc))
 
     def _compose_scene_prompt(self):
-        models_folder = Path("Models")
+        models_folder = MODELS_DIR
         if not models_folder.exists():
             messagebox.showerror("Error", f"Model folder not found:\n{models_folder.resolve()}")
             return
-
-        prompt = simpledialog.askstring(
-            "Compose Scene",
-            "Enter a scene prompt (for example: a cat next to a dog, a burger above a car):",
-            parent=self.root,
-        )
+        prompt = simpledialog.askstring("Compose Scene", "Enter a scene prompt:", parent=self.root)
         if prompt is None:
             return
-
         try:
             self.generation_prompt_var.set(prompt.strip())
-            output_image, output_path, scene = generate_scene_from_prompt(
-                prompt=prompt,
-                models_folder=models_folder,
-                device=self.device,
-                output_dir=Path("Outputs"),
-                target_size=(self.resolution_var.get(), self.resolution_var.get()),
-            )
+            output_image, output_path, scene = generate_scene_from_prompt(prompt=prompt, models_folder=models_folder, device=self.device, output_dir=OUTPUTS_DIR, target_size=(self.resolution_var.get(), self.resolution_var.get()))
             self._display_image(output_image)
             description = self._describe_scene(scene)
             relation = "layered_depth" if isinstance(scene, LayeredScene) else scene.relation
-            self.status_var.set(
-                f"Composed scene: {description} ({relation}) -> {output_path.name}"
-            )
+            self.status_var.set(f"Composed scene: {description} ({relation}) -> {output_path.name}")
         except Exception as exc:
             messagebox.showerror("Compose Scene", str(exc))
 
     def _merge_models(self):
-        models_folder = Path("Models")
+        models_folder = MODELS_DIR
         if not models_folder.exists():
             messagebox.showerror("Merge Models", f"Model folder not found:\n{models_folder.resolve()}")
             return
 
-        selected = filedialog.askopenfilenames(
-            title="Select model checkpoints to merge",
-            initialdir=str(models_folder.resolve()),
-            filetypes=self.MODEL_FILE_TYPES,
-        )
+        selected = filedialog.askopenfilenames(title="Select model checkpoints to merge", initialdir=str(models_folder.resolve()), filetypes=self.MODEL_FILE_TYPES)
         if not selected:
             return
-
         checkpoint_paths = [Path(path) for path in selected]
         if len(checkpoint_paths) < 2:
             messagebox.showerror("Merge Models", "Select at least two checkpoints.")
             return
 
-        strategy = simpledialog.askstring(
-            "Merge Models",
-            "Enter merge strategy: mean, weighted, or slerp",
-            initialvalue="mean",
-            parent=self.root,
-        )
+        # Safety Check: Prevent mixing RGB VAE and Wavelet
+        checkpoint_modes = []
+        for path in checkpoint_paths:
+            try:
+                checkpoint = safe_torch_load(path, map_location="cpu")
+                mode = checkpoint.get("reconstruction_mode", "RGB VAE")
+                checkpoint_modes.append(mode)
+            except Exception:
+                messagebox.showerror("Merge Models", f"Could not read metadata from {path.name}.")
+                return
+        
+        if len(set(checkpoint_modes)) > 1:
+            messagebox.showerror("Merge Models", "Cannot merge RGB VAE and Wavelet models because their reconstruction spaces are different.")
+            return
+
+        strategy = simpledialog.askstring("Merge Models", "Enter merge strategy: mean, weighted, or slerp", initialvalue="mean", parent=self.root)
         if strategy is None:
             return
         strategy = strategy.strip().lower()
@@ -4595,11 +4653,7 @@ Hardware Status
 
         weights: list[float] | None = None
         if strategy == "weighted":
-            raw_weights = simpledialog.askstring(
-                "Merge Models",
-                "Enter one comma-separated weight per selected checkpoint.",
-                parent=self.root,
-            )
+            raw_weights = simpledialog.askstring("Merge Models", "Enter one comma-separated weight per selected checkpoint.", parent=self.root)
             if raw_weights is None:
                 return
             try:
@@ -4608,20 +4662,12 @@ Hardware Status
                 messagebox.showerror("Merge Models", "Weights must be numeric values.")
                 return
             if len(weights) != len(checkpoint_paths):
-                messagebox.showerror(
-                    "Merge Models",
-                    f"Expected {len(checkpoint_paths)} weights, received {len(weights)}.",
-                )
+                messagebox.showerror("Merge Models", f"Expected {len(checkpoint_paths)} weights, received {len(weights)}.")
                 return
 
         output_path = models_folder / f"merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
         try:
-            merged_path = merge_checkpoints(
-                checkpoint_paths=checkpoint_paths,
-                output_path=output_path,
-                strategy=strategy,
-                weights=weights,
-            )
+            merged_path = merge_checkpoints(checkpoint_paths=checkpoint_paths, output_path=output_path, strategy=strategy, weights=weights)
             if self.model_map_window is not None and self.model_map_window.winfo_exists():
                 self._refresh_model_map()
             self.status_var.set(f"Merged {len(checkpoint_paths)} models -> {merged_path.name}")
@@ -4632,11 +4678,7 @@ Hardware Status
     def _describe_scene(self, scene: ParsedScene | LayeredScene) -> str:
         if isinstance(scene, LayeredScene):
             labels = []
-            for layer_name, scene_object in (
-                ("background", scene.background),
-                ("midground", scene.midground),
-                ("frontground", scene.frontground),
-            ):
+            for layer_name, scene_object in (("background", scene.background), ("midground", scene.midground), ("frontground", scene.frontground)):
                 if scene_object is not None:
                     labels.append(f"{layer_name}:{scene_object.noun}")
             return ", ".join(labels) if labels else scene.prompt
@@ -4651,7 +4693,6 @@ Hardware Status
         self._generate()
 
     def _generate_image(self, model):
-        """Placeholder handoff for prompt-selected models."""
         if model is None:
             raise ValueError("No model is loaded.")
         self._generate()
@@ -4668,30 +4709,18 @@ Hardware Status
             self._stop_model_cycle()
             self.status_var.set("Model shuffle stopped.")
             return
-
-        use_folder = messagebox.askyesnocancel(
-            "Model Shuffle",
-            "Choose models from a folder?\n\nYes = select a folder\nNo = pick specific model files",
-            parent=self.root,
-        )
+        use_folder = messagebox.askyesnocancel("Model Shuffle", "Choose models from a folder?\n\nYes = select a folder\nNo = pick specific model files", parent=self.root)
         if use_folder is None:
             return
 
         selected_paths: list[Path] = []
         if use_folder:
-            folder = filedialog.askdirectory(
-                title="Select folder with model files",
-                parent=self.root,
-            )
+            folder = filedialog.askdirectory(title="Select folder with model files", parent=self.root)
             if not folder:
                 return
             selected_paths = list_model_paths(Path(folder))
         else:
-            paths = filedialog.askopenfilenames(
-                title="Select model files",
-                filetypes=self.MODEL_FILE_TYPES,
-                parent=self.root,
-            )
+            paths = filedialog.askopenfilenames(title="Select model files", filetypes=self.MODEL_FILE_TYPES, parent=self.root)
             if not paths:
                 return
             selected_paths = [Path(p) for p in paths]
@@ -4699,15 +4728,12 @@ Hardware Status
         if not selected_paths:
             messagebox.showerror("Model Shuffle", "No model files were found or selected.")
             return
-
         self.model_cycle_paths = sorted(selected_paths, key=lambda path: path.name.lower())
         self._shuffle_model_cycle_queue()
         self.model_cycle_active = True
         self.auto_cycle_var.set(False)
         self.dream_cycle_var.set(False)
-        self.status_var.set(
-            f"Model shuffle started with {len(self.model_cycle_paths)} model(s)."
-        )
+        self.status_var.set(f"Model shuffle started with {len(self.model_cycle_paths)} model(s).")
         self._model_cycle_loop()
 
     def _model_cycle_loop(self):
@@ -4725,9 +4751,7 @@ Hardware Status
             self._load_model_file(model_path)
             self._generate()
             remaining = len(self.model_cycle_queue)
-            self.status_var.set(
-                f"Model shuffle: {model_path.name} | Remaining this round: {remaining}"
-            )
+            self.status_var.set(f"Model shuffle: {model_path.name} | Remaining this round: {remaining}")
         except Exception as exc:
             self.status_var.set(f"Model shuffle skipped {model_path.name}: {exc}")
 
@@ -4757,18 +4781,13 @@ Hardware Status
     def _get_blended_anchor(self, blend_count: int):
         if self.training_tensors is None or self.training_tensors.size(0) == 0:
             return None
-
         total = self.training_tensors.size(0)
         count = max(2, min(int(blend_count), 64))
         if total >= count:
-            # indices must live on the same device as the tensor we index
             idx = torch.randperm(total, device=self.training_tensors.device)[:count]
         else:
             idx = torch.randint(0, total, (count,), device=self.training_tensors.device)
-        anchors = self.training_tensors[idx].to(
-            self.device,
-            non_blocking=(getattr(self.device, "type", "") == "cuda"),
-        )
+        anchors = self.training_tensors[idx].to(self.device, non_blocking=(getattr(self.device, "type", "") == "cuda"))
         mu, _ = self.model.encode(anchors)
         weights = torch.rand(count, device=mu.device)
         weights = weights / weights.sum()
@@ -4800,29 +4819,19 @@ Hardware Status
                 if memory_anchor is not None:
                     noise = torch.randn_like(memory_anchor, device=memory_anchor.device)
                     return memory_anchor + (noise * max(0.05, intensity * 0.65))
-
             if blend_enabled:
                 blended = self._get_blended_anchor(blend_count)
                 if blended is not None:
                     noise = torch.randn_like(blended, device=blended.device)
                     return blended + (intensity * noise)
-
             if self.training_tensors is not None and self.training_tensors.size(0) > 0:
                 total_items = self.training_tensors.size(0)
                 if personality == "Nostalgic" and total_items > 1:
                     nostalgic_span = max(1, total_items // 3)
                     idx = torch.randint(0, nostalgic_span, (1,), device=self.training_tensors.device)
                 else:
-                    idx = torch.randint(
-                        0,
-                        total_items,
-                        (1,),
-                        device=self.training_tensors.device,
-                    )
-                img_batch = self.training_tensors[idx].to(
-                    self.device,
-                    non_blocking=(getattr(self.device, "type", "") == "cuda"),
-                )
+                    idx = torch.randint(0, total_items, (1,), device=self.training_tensors.device)
+                img_batch = self.training_tensors[idx].to(self.device, non_blocking=(getattr(self.device, "type", "") == "cuda"))
                 mu, _ = self.model.encode(img_batch)
                 noise = torch.randn_like(mu, device=mu.device)
                 if personality == "Chaotic":
@@ -4843,11 +4852,7 @@ Hardware Status
         rows = math.ceil(len(images) / columns)
         pad = 12
         label_h = 28
-        canvas = Image.new(
-            "RGB",
-            (columns * width + (columns + 1) * pad, rows * (height + label_h) + (rows + 1) * pad),
-            color=(8, 10, 18),
-        )
+        canvas = Image.new("RGB", (columns * width + (columns + 1) * pad, rows * (height + label_h) + (rows + 1) * pad), color=(8, 10, 18))
         draw = ImageDraw.Draw(canvas)
         for idx, image in enumerate(images, start=1):
             row = (idx - 1) // columns
@@ -4859,40 +4864,20 @@ Hardware Status
             draw.text((x, y + height + 6), f"#{idx}", fill=(235, 240, 255))
         return canvas
 
-    def _render_latent_gallery(
-        self,
-        latents,
-        *,
-        mode: str,
-        numbered: bool = False,
-        status_label: str = "",
-        save_memory: bool = True,
-    ):
+    def _render_latent_gallery(self, latents, *, mode: str, numbered: bool = False, status_label: str = "", save_memory: bool = True):
         images = []
         self.last_generated_latents = []
 
         with torch.no_grad():
             for latent in latents:
                 latent_device = latent.to(self.device)
-                recon = self._decode_latent(
-                    latent_device,
-                    show_steps=(len(latents) == 1 and mode == "generate" and self.show_iterations_var.get()),
-                )
-                image = tensor_to_pil(recon)
+                recon = self._decode_latent(latent_device, show_steps=(len(latents) == 1 and mode == "generate" and self.show_iterations_var.get()))
+                image = tensor_to_pil(self._decode_model_output_to_rgb(recon))
                 images.append(image)
                 stored_latent = latent_device.detach().cpu()
                 self.last_generated_latents.append(stored_latent)
                 if save_memory:
-                    self._remember_generation(
-                        image,
-                        stored_latent,
-                        mode=mode,
-                        extra={
-                            "diffusion_steps": int(self.diffusion_steps_var.get()),
-                            "diffusion_strength": float(self.diffusion_strength_var.get()),
-                            "iterations": int(self.iterations_var.get()),
-                        },
-                    )
+                    self._remember_generation(image, stored_latent, mode=mode, extra={"diffusion_steps": int(self.diffusion_steps_var.get()), "diffusion_strength": float(self.diffusion_strength_var.get()), "iterations": int(self.iterations_var.get())})
 
         if len(images) == 1:
             final_image = images[0]
@@ -4908,30 +4893,20 @@ Hardware Status
 
     def _dream_cycle_loop(self):
         if not self.dream_cycle_var.get() or self.model is None: return
-
-        # Initialize or Pick New Target
         if self.current_latent is None:
             self.current_latent = self._get_random_latent()
             self.target_latent = self._get_random_latent()
             self.interpolation_step = 0
-        
-        # When we finish one segment, target becomes the new start
         if self.interpolation_step >= self.total_interpolation_steps:
             self.current_latent = self.target_latent
             self.target_latent = self._get_random_latent()
             self.interpolation_step = 0
-
-        # Update smoothness/speed from slider live
         self.total_interpolation_steps = int(self.speed_scale.get())
-        
-        # Calculate alpha
         alpha = self.interpolation_step / self.total_interpolation_steps
-        
         with torch.no_grad():
-            # Linear Slerp transition
             interp_latent = slerp(alpha, self.current_latent, self.target_latent)
             recon = self._decode_latent(interp_latent, show_steps=False)
-            image = tensor_to_pil(recon)
+            image = tensor_to_pil(self._decode_model_output_to_rgb(recon))
             self._display_image(image)
             if self.interpolation_step == 0:
                 self.last_generated_latents = [interp_latent.detach().cpu()]
@@ -4939,7 +4914,6 @@ Hardware Status
 
         self.interpolation_step += 1
         self.status_var.set("Dreaming Cycle active...")
-        
         fps = max(1, int(self.dream_fps_var.get()))
         delay_ms = max(16, int(1000 / fps))
         self._after(delay_ms, self._dream_cycle_loop)
@@ -4963,28 +4937,16 @@ Hardware Status
             for _ in range(output_count):
                 latents.append(self._get_random_latent())
 
-        self._render_latent_gallery(
-            latents,
-            mode=self._current_mode_label(),
-            numbered=False,
-            status_label="",
-            save_memory=not self.auto_cycle_var.get(),
-        )
+        self._render_latent_gallery(latents, mode=self._current_mode_label(), numbered=False, status_label="", save_memory=not self.auto_cycle_var.get())
         if not self.auto_cycle_var.get() and not self.dream_cycle_var.get():
             mode = f"Blend x{blend_count}" if blend_enabled else "Single anchor"
-            self.status_var.set(
-                f"Generated ({self.personality_var.get()} | Intensity: {intensity:.1f} | {mode} | Diffusion: {'on' if use_diffusion else 'off'} x{diffusion_steps} | Outputs: {output_count})"
-            )
+            self.status_var.set(f"Generated ({self.personality_var.get()} | Intensity: {intensity:.1f} | {mode} | Diffusion: {'on' if use_diffusion else 'off'} x{diffusion_steps} | Outputs: {output_count})")
 
     def _decode_latent(self, z, show_steps: bool = False):
         current = z
         if self.use_latent_diffusion_var.get() and self.latent_diffusion is not None:
             diffusion = self._ensure_latent_diffusion()
-            current = diffusion.polish_latent(
-                current,
-                strength=float(self.latent_diffusion_strength_var.get()),
-            )
-
+            current = diffusion.polish_latent(current, strength=float(self.latent_diffusion_strength_var.get()))
         if self.use_mini_diffusion_var.get():
             current = self._mini_diffusion_refine(current, show_steps=show_steps)
 
@@ -4994,7 +4956,7 @@ Hardware Status
             mu_step, _ = self.model.encode(recon)
             recon = self.model.decode(mu_step)
             if show_steps:
-                self._display_image(tensor_to_pil(recon))
+                self._display_image(tensor_to_pil(self._decode_model_output_to_rgb(recon)))
                 self.root.update()
                 self._after(50)
         return recon
@@ -5011,15 +4973,9 @@ Hardware Status
             else:
                 t_value = 1.0 - (step_idx / (steps - 1))
             t = torch.full((current.size(0), 1), t_value, device=current.device)
-            predicted_noise = torch.nan_to_num(
-                self.model.predict_latent_noise(current, t),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
+            predicted_noise = torch.nan_to_num(self.model.predict_latent_noise(current, t), nan=0.0, posinf=0.0, neginf=0.0)
             step_scale = strength * intensity_scale * (0.2 + 0.8 * t_value)
             current = current - (predicted_noise * step_scale)
-
             if step_idx < steps - 1:
                 residual_scale = 0.03 * intensity_scale * t_value
                 current = current + (torch.randn_like(current) * residual_scale)
@@ -5027,7 +4983,7 @@ Hardware Status
 
             if show_steps:
                 preview = self.model.decode(current)
-                self._display_image(tensor_to_pil(preview))
+                self._display_image(tensor_to_pil(self._decode_model_output_to_rgb(preview)))
                 self.root.update()
                 self._after(50)
 
