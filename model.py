@@ -45,12 +45,16 @@ class VAE(nn.Module):
         self,
         latent_dim: int = 256,
         in_channels: int = 3,
+        out_channels: int = 3,
         output_size: tuple[int, int] = (256, 256),
+        output_activation: str = "sigmoid",
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.in_channels = in_channels
+        self.out_channels = out_channels
         self.output_size = output_size
+        self.output_activation = output_activation
 
         # Downsample while preserving flexibility for different input resolutions.
         self.encoder = nn.Sequential(
@@ -93,7 +97,7 @@ class VAE(nn.Module):
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2),
-            nn.ConvTranspose2d(32, in_channels, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(32, out_channels, kernel_size=4, stride=2, padding=1),
         )
 
     def encode(self, x: Tensor) -> tuple[Tensor, Tensor]:
@@ -115,7 +119,11 @@ class VAE(nn.Module):
         h = h.reshape(h.size(0), 512, 4, 4)
         x = self.decoder(h)
         x = F.interpolate(x, size=self.output_size, mode="bilinear", align_corners=False)
-        return torch.sigmoid(x)
+        if self.output_activation == "sigmoid":
+            return torch.sigmoid(x)
+        if self.output_activation == "tanh":
+            return torch.tanh(x)
+        return x
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         mu, logvar = self.encode(x)
@@ -127,16 +135,33 @@ class VAE(nn.Module):
         return self.latent_denoiser(z, t)
 
 
-def vae_loss(recon: Tensor, x: Tensor, mu: Tensor, logvar: Tensor) -> Tensor:
-    """VAE loss = reconstruction (BCE) + KL divergence."""
-    eps = 1e-6
-    recon = torch.nan_to_num(recon, nan=0.5, posinf=1.0, neginf=0.0).clamp(eps, 1.0 - eps)
-    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+def vae_loss(
+    recon: Tensor,
+    x: Tensor,
+    mu: Tensor,
+    logvar: Tensor,
+    reconstruction_loss: str = "bce",
+) -> Tensor:
+    """VAE loss = reconstruction loss + KL divergence.
+
+    RGB APVD uses BCE on normalized pixels. Wavelet APVD should use MSE because
+    Haar coefficients can be negative and the LL band can exceed 1.0.
+    """
     mu = torch.nan_to_num(mu, nan=0.0, posinf=1e4, neginf=-1e4)
     logvar = torch.nan_to_num(logvar, nan=0.0, posinf=12.0, neginf=-12.0).clamp(-12.0, 12.0)
-    bce = F.binary_cross_entropy(recon, x, reduction="sum")
+
+    if reconstruction_loss == "mse":
+        recon_safe = torch.nan_to_num(recon, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        x_safe = torch.nan_to_num(x, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        recon_term = F.mse_loss(recon_safe, x_safe, reduction="sum")
+    else:
+        eps = 1e-6
+        recon_safe = torch.nan_to_num(recon, nan=0.5, posinf=1.0, neginf=0.0).clamp(eps, 1.0 - eps)
+        x_safe = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        recon_term = F.binary_cross_entropy(recon_safe, x_safe, reduction="sum")
+
     kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return bce + kl
+    return recon_term + kl
 
 
 def latent_denoiser_loss(

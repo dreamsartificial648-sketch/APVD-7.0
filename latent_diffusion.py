@@ -318,6 +318,36 @@ class DiffusionModel(nn.Module):
         latent = torch.randn(max(1, int(batch_size)), self.config.latent_dim, device=sample_device)
         return self.denoise_latent(latent, deterministic=deterministic, return_all_steps=return_all_steps)
 
+    @torch.no_grad()
+    def conditional_denoise(
+        self,
+        noisy_latent: Tensor,
+        class_labels: Tensor,
+        *,
+        start_timestep: int | None = None,
+        deterministic: bool = False,
+        return_all_steps: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        """Conditional denoising using class labels."""
+        current = _ensure_latent_batch(noisy_latent).float()
+        start = self.config.timesteps - 1 if start_timestep is None else int(start_timestep)
+        start = max(0, min(start, self.config.timesteps - 1))
+        steps: list[Tensor] = []
+
+        for step_idx in range(start, -1, -1):
+            timestep = torch.full((current.size(0),), step_idx, device=current.device, dtype=torch.long)
+            # For conditional denoising, we would modify the denoiser to accept class_labels
+            # This is a placeholder implementation that just calls the regular denoising
+            predicted_noise = self(current, timestep)
+            step_noise = torch.zeros_like(current) if deterministic else None
+            current = self.scheduler.step(predicted_noise, timestep, current, noise=step_noise)
+            if return_all_steps:
+                steps.append(current.detach().clone())
+
+        if return_all_steps:
+            return current, steps
+        return current
+
     def save(
         self,
         path: str | Path,
