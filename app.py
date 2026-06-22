@@ -33,6 +33,7 @@ try:
     import cv2
     import numpy as np
     import torch
+    import torch.nn.functional as F
     import tkinter as tk
     from PIL import Image, ImageDraw, ImageFile
     from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -120,6 +121,18 @@ PRECISION_MODE_CHOICES = [
     "FP16 Fast",
     "BF16 Balanced",
 ]
+LOSS_MODE_CHOICES = [
+    "Classic VAE",
+    "Structure Stable",
+    "Sharp Detail",
+    "Experimental Structure",
+]
+LOSS_MODE_HELP = {
+    "Classic VAE": "Current APVD loss. Best for normal dream/generalized behavior.",
+    "Structure Stable": "Adds gentle L1 shape pressure so objects stay more like themselves.",
+    "Sharp Detail": "Adds L1 plus edge loss for stronger outlines and details.",
+    "Experimental Structure": "Heavier structure mix using L1 and edge loss. Useful for cars/characters, but more experimental.",
+}
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 PERSONALITY_PRESETS = {
     "Manual": {
@@ -419,6 +432,8 @@ class APVDApp:
         # Precision Mode replaces the old mixed-precision checkbox, but
         # mixed_precision_var is kept as a compatibility flag for older code/metadata.
         self.precision_mode_var = tk.StringVar(value="Auto Recommended")
+        self.loss_mode_var = tk.StringVar(value="Classic VAE")
+        self.loss_mode_help_var = tk.StringVar(value=LOSS_MODE_HELP["Classic VAE"])
         self.mixed_precision_var = tk.BooleanVar(value=True)
         self.nan_guard_var = tk.BooleanVar(value=True)
         self.video_stride_var = tk.IntVar(value=30)
@@ -1239,6 +1254,103 @@ class APVDApp:
         )
         return DataLoader(dataset, **loader_kwargs)
 
+    def _on_loss_mode_changed(self, *_args) -> None:
+        mode = self.loss_mode_var.get() if hasattr(self, "loss_mode_var") else "Classic VAE"
+        if mode not in LOSS_MODE_CHOICES:
+            mode = "Classic VAE"
+            self.loss_mode_var.set(mode)
+        if hasattr(self, "loss_mode_help_var"):
+            self.loss_mode_help_var.set(LOSS_MODE_HELP.get(mode, LOSS_MODE_HELP["Classic VAE"]))
+        if hasattr(self, "status_var"):
+            self.status_var.set(f"Loss mode set to {mode}.")
+
+    @staticmethod
+    def _loss_mode_weights(mode: str) -> dict[str, float]:
+        """Return blend weights for APVD training losses.
+
+        base = existing VAE reconstruction+KL loss.
+        l1 = direct shape-preserving L1 difference.
+        edge = Sobel-style edge/outline difference.
+        """
+        if mode == "Structure Stable":
+            return {"base": 0.80, "l1": 0.20, "edge": 0.00}
+        if mode == "Sharp Detail":
+            return {"base": 0.75, "l1": 0.15, "edge": 0.10}
+        if mode == "Experimental Structure":
+            return {"base": 0.65, "l1": 0.20, "edge": 0.15}
+        return {"base": 1.00, "l1": 0.00, "edge": 0.00}
+
+    @staticmethod
+    def _sobel_edges_for_loss(tensor: torch.Tensor) -> torch.Tensor:
+        """Small Sobel edge extractor used only for structure-aware loss modes."""
+        if tensor.ndim != 4:
+            return tensor
+        channels = int(tensor.shape[1])
+        if channels <= 0:
+            return tensor
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        kernel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=tensor.dtype,
+            device=tensor.device,
+        ).view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+        kernel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            dtype=tensor.dtype,
+            device=tensor.device,
+        ).view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+        gx = F.conv2d(tensor, kernel_x, padding=1, groups=channels)
+        gy = F.conv2d(tensor, kernel_y, padding=1, groups=channels)
+        return torch.sqrt((gx * gx) + (gy * gy) + 1e-6)
+
+    def _apvd_training_loss(
+        self,
+        recon: torch.Tensor,
+        batch: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        *,
+        is_wavelet: bool,
+        loss_mode: str,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """APVD loss with optional structure/detail stabilizers.
+
+        This intentionally does not turn APVD into a GAN. It keeps the normal VAE
+        objective and optionally adds L1/edge pressure for shape consistency.
+        """
+        if loss_mode not in LOSS_MODE_CHOICES:
+            loss_mode = "Classic VAE"
+        weights = self._loss_mode_weights(loss_mode)
+        base_loss = vae_loss(
+            recon,
+            batch,
+            mu,
+            logvar,
+            reconstruction_loss="mse" if is_wavelet else "bce",
+        )
+        total = base_loss * float(weights["base"])
+        l1_loss = recon.new_tensor(0.0)
+        edge_loss = recon.new_tensor(0.0)
+        if weights["l1"] > 0.0:
+            recon_l1 = torch.nan_to_num(recon, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+            batch_l1 = torch.nan_to_num(batch, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+            l1_loss = F.l1_loss(recon_l1, batch_l1, reduction="sum")
+            total = total + (l1_loss * float(weights["l1"]))
+        if weights["edge"] > 0.0:
+            recon_edges = self._sobel_edges_for_loss(recon)
+            batch_edges = self._sobel_edges_for_loss(batch)
+            edge_loss = F.l1_loss(recon_edges, batch_edges, reduction="sum")
+            total = total + (edge_loss * float(weights["edge"]))
+        metrics = {
+            "base_loss": float(base_loss.detach().float().item()),
+            "l1_loss": float(l1_loss.detach().float().item()),
+            "edge_loss": float(edge_loss.detach().float().item()),
+            "base_weight": float(weights["base"]),
+            "l1_weight": float(weights["l1"]),
+            "edge_weight": float(weights["edge"]),
+        }
+        return total, metrics
+
     @staticmethod
     def _training_intensity_percent(choice: str) -> int:
         match = re.match(r"\s*(\d+)", str(choice))
@@ -1410,6 +1522,28 @@ BF16 Balanced
 - Uses bfloat16 autocast on supported CUDA GPUs.
 - Often more stable than FP16 while still faster than full FP32.
 - Falls back to FP32 Stable if unsupported.
+
+
+========================
+ LOSS MODE
+========================
+
+Classic VAE
+- Original APVD training behavior.
+- Best for normal dream/generalized reconstructions.
+
+Structure Stable
+- Adds gentle L1 shape loss.
+- Helps cars, characters, and objects keep their silhouette.
+
+Sharp Detail
+- Adds L1 plus Sobel edge loss.
+- Helps outlines, wheels, windows, and borders stay clearer.
+
+Experimental Structure
+- Stronger structure/detail mix.
+- Can improve shape consistency, but may reduce some dreaminess or need tuning.
+
 
 
 ========================
@@ -1767,26 +1901,30 @@ Hardware Status
         self._grid_row(training_frame, 7, "Precision Mode:", precision_box)
         precision_box.bind("<<ComboboxSelected>>", self._on_precision_mode_changed)
         ttk.Label(training_frame, text="FP32 = safest. FP16 = fastest when stable. BF16 = supported-GPU balance.", style="SurfaceMuted.TLabel").grid(row=7, column=2, columnspan=3, sticky=tk.W, pady=(8, 0))
-        ttk.Checkbutton(training_frame, text="NaN Guard / Auto-Recover", variable=self.nan_guard_var).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
-        self._category_label(training_frame, "Data Loading", 9)
+        loss_mode_box = ttk.Combobox(training_frame, textvariable=self.loss_mode_var, values=LOSS_MODE_CHOICES, state="readonly", width=22)
+        self._grid_row(training_frame, 8, "Loss Mode:", loss_mode_box)
+        loss_mode_box.bind("<<ComboboxSelected>>", self._on_loss_mode_changed)
+        ttk.Label(training_frame, textvariable=self.loss_mode_help_var, style="SurfaceMuted.TLabel").grid(row=8, column=2, columnspan=3, sticky=tk.W, pady=4)
+        ttk.Checkbutton(training_frame, text="NaN Guard / Auto-Recover", variable=self.nan_guard_var).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        self._category_label(training_frame, "Data Loading", 10)
         self.loader_spin = ttk.Spinbox(training_frame, from_=0, to=32, increment=1, width=8, textvariable=self.loader_workers_var)
-        self._grid_row(training_frame, 10, "Batch Loads:", self.loader_spin)
+        self._grid_row(training_frame, 11, "Batch Loads:", self.loader_spin)
         self.prefetch_spin = ttk.Spinbox(training_frame, from_=1, to=512, increment=1, width=8, textvariable=self.prefetch_batches_var)
-        self._grid_row(training_frame, 10, "Prefetch Batches:", self.prefetch_spin, column=2)
+        self._grid_row(training_frame, 11, "Prefetch Batches:", self.prefetch_spin, column=2)
         cache_spin = ttk.Spinbox(training_frame, from_=0, to=200000, increment=512, width=8, textvariable=self.dataset_cache_items_var)
-        self._grid_row(training_frame, 11, "Dataset Cache:", cache_spin)
-        ttk.Label(training_frame, text="Approx. total decoded/resized images kept warm in RAM; split across workers.", style="SurfaceMuted.TLabel").grid(row=11, column=2, columnspan=3, sticky=tk.W, pady=4)
+        self._grid_row(training_frame, 12, "Dataset Cache:", cache_spin)
+        ttk.Label(training_frame, text="Approx. total decoded/resized images kept warm in RAM; split across workers.", style="SurfaceMuted.TLabel").grid(row=12, column=2, columnspan=3, sticky=tk.W, pady=4)
         self.intensity_box = ttk.Combobox(training_frame, textvariable=self.training_intensity_var, values=TRAINING_INTENSITY_CHOICES, state="readonly", width=18)
         self.intensity_box.bind("<<ComboboxSelected>>", self._apply_training_intensity)
-        self._grid_row(training_frame, 12, "Training Intensity:", self.intensity_box)
-        ttk.Checkbutton(training_frame, text="Blend memory into training", variable=self.include_memory_training_var).grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        self._grid_row(training_frame, 13, "Training Intensity:", self.intensity_box)
+        ttk.Checkbutton(training_frame, text="Blend memory into training", variable=self.include_memory_training_var).grid(row=14, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         memory_limit_spin = ttk.Spinbox(training_frame, from_=0, to=10000, increment=8, width=8, textvariable=self.memory_training_limit_var)
-        self._grid_row(training_frame, 13, "Memory Images:", memory_limit_spin, column=2, pad_y=8)
-        self._category_label(training_frame, "Video Sampling", 14)
+        self._grid_row(training_frame, 14, "Memory Images:", memory_limit_spin, column=2, pad_y=8)
+        self._category_label(training_frame, "Video Sampling", 15)
         video_stride_spin = ttk.Spinbox(training_frame, from_=1, to=10000, increment=1, width=8, textvariable=self.video_stride_var)
-        self._grid_row(training_frame, 15, "Video Stride:", video_stride_spin)
+        self._grid_row(training_frame, 16, "Video Stride:", video_stride_spin)
         max_frames_spin = ttk.Spinbox(training_frame, from_=0, to=1_000_000, increment=100, width=8, textvariable=self.video_max_frames_var)
-        self._grid_row(training_frame, 15, "Max Frames:", max_frames_spin, column=2)
+        self._grid_row(training_frame, 16, "Max Frames:", max_frames_spin, column=2)
 
         gen_tools_frame = self._make_section(content, "Generation Tools", open_by_default=True)
         self._category_label(gen_tools_frame, "Generate And Cycle", 0)
@@ -3021,6 +3159,9 @@ Hardware Status
                 self.loaded_model_path = None
 
         precision = self._resolve_precision_settings()
+        loss_mode = self.loss_mode_var.get() if hasattr(self, "loss_mode_var") else "Classic VAE"
+        if loss_mode not in LOSS_MODE_CHOICES:
+            loss_mode = "Classic VAE"
         amp_enabled = bool(precision["autocast_enabled"])
         scaler_enabled = bool(precision["scaler_enabled"])
         autocast_dtype = precision["autocast_dtype"]
@@ -3063,7 +3204,7 @@ Hardware Status
         total_training_images = len(dataset)
 
         self._after(0, lambda: self.load_progress_var.set(0.0))
-        self._after(0, lambda p=str(precision["requested"]), r=str(precision["resolved"]): self.status_var.set(f"Training using precision: {p} → {r}." if p == "Auto Recommended" else f"Training using precision: {r}."))
+        self._after(0, lambda p=str(precision["requested"]), r=str(precision["resolved"]), lm=loss_mode: self.status_var.set((f"Training using precision: {p} → {r}" if p == "Auto Recommended" else f"Training using precision: {r}") + f" | Loss: {lm}."))
 
         prefix_parts: list[str] = []
         if batch_index is not None and batch_total is not None:
@@ -3101,12 +3242,13 @@ Hardware Status
                 with torch.amp.autocast("cuda", **autocast_kwargs):
                     recon, mu, logvar = self.model(batch)
                 with torch.amp.autocast("cuda", enabled=False):
-                    recon_loss = vae_loss(
+                    recon_loss, structure_loss_metrics = self._apvd_training_loss(
                         recon.float(),
                         batch.float(),
                         mu.float(),
                         logvar.float(),
-                        reconstruction_loss="mse" if is_wavelet else "bce",
+                        is_wavelet=is_wavelet,
+                        loss_mode=loss_mode,
                     )
                     denoise_loss = latent_denoiser_loss(self.model, mu.detach().float())
                     loss = recon_loss + (0.25 * denoise_loss)
@@ -3168,6 +3310,8 @@ Hardware Status
             "precision_mode": str(precision["requested"]),
             "precision_resolved": str(precision["resolved"]),
             "precision_dtype": str(precision["dtype_label"]),
+            "loss_mode": loss_mode,
+            "loss_mode_weights": self._loss_mode_weights(loss_mode),
             "mixed_precision": bool(amp_enabled),
             "nan_guard": bool(self.nan_guard_var.get()), "batch_load_workers": loader_workers,
             "prefetch_batches": prefetch_batches, "saved_at": datetime.now().isoformat(timespec="seconds"),
