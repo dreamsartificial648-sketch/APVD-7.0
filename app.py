@@ -3305,7 +3305,7 @@ Hardware Status
                     resolution=resolution, fps=fps, progress_callback=progress_update
                 )
             except Exception as exc:
-                self._after(0, lambda: (self.status_var.set("Reconstruction video export failed."), messagebox.showerror("Reconstruction Video", str(exc), parent=self.root)))
+                self._after(0, lambda msg=str(exc): (self.status_var.set("Reconstruction video export failed."), messagebox.showerror("Reconstruction Video", msg, parent=self.root)))
                 return
 
             codec_note = "H.264" if result.used_h264 else "MP4 fallback codec"
