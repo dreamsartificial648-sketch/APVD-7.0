@@ -45,6 +45,11 @@ except Exception as e:
     input("Press Enter to exit...")
     raise SystemExit(5) from e
 
+try:
+    import psutil
+except Exception:
+    psutil = None  # Resource prediction panel will show "unavailable" for RAM if this is missing.
+
 from memory_system import MemoryBank, breed_latents, parse_selection_indices, summarize_memory
 from model import VAE, vae_loss, latent_denoiser_loss, get_device
 from model_merger import merge_checkpoints
@@ -75,6 +80,9 @@ from utils import (
 APP_BASE_DIR = Path(__file__).resolve().parent
 MEMORY_DIR = APP_BASE_DIR / "Memory"
 MODELS_DIR = APP_BASE_DIR / "Models"
+CHECKPOINTS_DIR = APP_BASE_DIR / "Checkpoints"
+CRASH_STATE_PATH = CHECKPOINTS_DIR / "crash_state.json"
+CRASH_CHECKPOINT_SLOTS = [CHECKPOINTS_DIR / f"crash_{i}.pt" for i in (1, 2, 3)]
 OUTPUTS_DIR = APP_BASE_DIR / "Outputs"
 DREAMIFY_OUTPUT_DIR = APP_BASE_DIR / "Dreamify_Output"
 DREAM_VIDEOS_DIR = APP_BASE_DIR / "Dream_Videos"
@@ -226,6 +234,105 @@ def safe_torch_load(path, *, map_location=None):
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+def load_crash_checkpoint(path, *, map_location=None):
+    """Crash checkpoints are produced locally by this app and include optimizer
+    state, so we always load with weights_only=False (no untrusted/remote files
+    ever go through this path)."""
+    return torch.load(path, map_location=map_location, weights_only=False)
+
+# --- Resource prediction -----------------------------------------------------
+# Bytes-per-element for the dtype actually used during the forward/backward pass.
+_DTYPE_BYTES = {"fp32": 4, "fp16": 2, "bf16": 2}
+
+# VAE encoder/decoder channel progression, mirroring model.py's VAE exactly.
+# Each entry is (out_channels, stride) for one Conv2d/ConvTranspose2d + BatchNorm + activation block.
+_VAE_ENCODER_STAGES = [(32, 2), (64, 2), (128, 2), (256, 2), (512, 2)]
+_VAE_DECODER_STAGES = [(256, 2), (128, 2), (64, 2), (32, 2)]  # final ConvTranspose2d to out_channels omitted (negligible)
+
+
+def estimate_training_ram_bytes(*, batch_size: int, resolution: int, in_channels: int,
+                                 effective_prefetch_per_worker: int, loader_workers: int,
+                                 dataset_cache_items: int) -> dict[str, int]:
+    """Exact-ish RAM estimate: dataset cache + in-flight prefetched batches.
+    Both are plain decoded float32 tensors sitting in regular/pinned host memory,
+    so this part of the estimate is straightforward arithmetic, not a guess."""
+    bytes_per_image = resolution * resolution * in_channels * 4  # decoded tensors are float32 before autocast
+    bytes_per_batch = bytes_per_image * batch_size
+
+    total_in_flight_batches = max(0, effective_prefetch_per_worker) * max(0, loader_workers)
+    prefetch_ram = total_in_flight_batches * bytes_per_batch
+    cache_ram = max(0, dataset_cache_items) * bytes_per_image
+
+    return {
+        "prefetch_ram_bytes": prefetch_ram,
+        "cache_ram_bytes": cache_ram,
+        "total_ram_bytes": prefetch_ram + cache_ram,
+        "total_in_flight_batches": total_in_flight_batches,
+    }
+
+
+def estimate_training_vram_bytes(*, batch_size: int, resolution: int, in_channels: int,
+                                  latent_dim: int, dtype_label: str, has_optimizer: bool = True) -> dict[str, int]:
+    """Rough VRAM estimate covering the dominant, computable terms: model weights,
+    optimizer state (Adam keeps 2 extra buffers per parameter), and encoder/decoder
+    activation maps sized from the VAE's known architecture. This intentionally
+    excludes CUDA allocator fragmentation/overhead and PyTorch's own reserved-but-
+    unused memory, so it includes a flat safety multiplier rather than claiming
+    precision we don't have."""
+    elem_bytes = _DTYPE_BYTES.get(dtype_label, 4)
+
+    # Activation memory: sum of (channels x H x W x batch) at every encoder/decoder stage.
+    activation_elements = 0
+    h = w = resolution
+    for out_ch, stride in _VAE_ENCODER_STAGES:
+        h, w = h // stride, w // stride
+        activation_elements += out_ch * h * w
+    for out_ch, stride in _VAE_DECODER_STAGES:
+        h, w = h * stride, w * stride
+        activation_elements += out_ch * h * w
+    activation_bytes = activation_elements * batch_size * elem_bytes
+    # Backward pass roughly doubles live activation memory (forward activations +
+    # gradients flowing back); this is an approximation, not an exact accounting.
+    activation_bytes *= 2
+
+    # Param + optimizer-state memory (architecture-independent of batch size).
+    enc_dim = 4 * 4 * 512
+    approx_params = 0
+    in_ch_running = in_channels
+    for out_ch, _ in _VAE_ENCODER_STAGES:
+        approx_params += (in_ch_running * out_ch * 4 * 4) + out_ch  # conv weight + bias, BN folded in approx.
+        in_ch_running = out_ch
+    approx_params += 2 * (enc_dim * latent_dim)  # fc_mu + fc_logvar
+    approx_params += enc_dim * latent_dim  # fc_decode
+    out_ch_running = 512
+    for out_ch, _ in _VAE_DECODER_STAGES:
+        approx_params += (out_ch_running * out_ch * 4 * 4) + out_ch
+        out_ch_running = out_ch
+    approx_params += out_ch_running * in_channels * 4 * 4  # final conv to out_channels
+
+    param_bytes = approx_params * 4  # weights kept in fp32 master copy even under AMP
+    optimizer_bytes = approx_params * 4 * (2 if has_optimizer else 0)  # AdamW: exp_avg + exp_avg_sq
+
+    raw_total = activation_bytes + param_bytes + optimizer_bytes
+    SAFETY_MULTIPLIER = 1.4  # covers allocator fragmentation/reserved memory we can't compute exactly
+    return {
+        "activation_bytes": activation_bytes,
+        "param_bytes": param_bytes,
+        "optimizer_bytes": optimizer_bytes,
+        "raw_total_bytes": raw_total,
+        "estimated_total_bytes": int(raw_total * SAFETY_MULTIPLIER),
+    }
+
+
+def estimate_seconds_per_batch(*, batch_size: int, resolution: int, device_type: str) -> float:
+    """Very rough pre-training ballpark, NOT a measurement. Scales a coarse
+    reference throughput by megapixels-per-image and batch size. Once training
+    is actually running, the live status bar's measured ETA is far more
+    trustworthy than this number."""
+    reference_seconds_per_megapixel_image = 0.012 if device_type == "cuda" else 0.18
+    megapixels = (resolution * resolution) / 1_000_000
+    return reference_seconds_per_megapixel_image * megapixels * batch_size
 
 def slerp(val, low, high):
     low_norm = low / torch.norm(low, dim=1, keepdim=True)
@@ -464,6 +571,7 @@ class APVDApp:
         self.precision_mode_var = tk.StringVar(value="Auto Recommended")
         self.loss_mode_var = tk.StringVar(value="Classic VAE")
         self.loss_mode_help_var = tk.StringVar(value=LOSS_MODE_HELP["Classic VAE"])
+        self.resource_prediction_var = tk.StringVar(value="Estimated resource usage will appear here.")
         self.mixed_precision_var = tk.BooleanVar(value=True)
         self.nan_guard_var = tk.BooleanVar(value=True)
         self.video_stride_var = tk.IntVar(value=30)
@@ -539,6 +647,7 @@ class APVDApp:
         self.reconstruction_mode_var = tk.StringVar(value="RGB VAE")
         self._settings_save_after_id: str | None = None
         self._settings_traces_installed = False
+        self._resource_prediction_after_id: str | None = None
         
         self._load_app_settings()
         
@@ -608,9 +717,12 @@ class APVDApp:
         self._configure_styles()
         self._build_ui()
         self._install_settings_autosave()
+        self._install_resource_prediction_traces()
         self._apply_user_level(update_status=False)
         self._refresh_memory_list()
         self._create_output_window()
+        self._update_resource_prediction()
+        self.root.after(400, self._check_for_crash_recovery)
 
     def _after(self, delay_ms: int, callback=None, *args):
         if callback is None:
@@ -1119,12 +1231,14 @@ class APVDApp:
                 "text": "#1c2430", "muted": "#596579", "accent": "#2d6cdf",
                 "accent_text": "#ffffff", "border": "#cfd8e6", "canvas": "#e7edf6",
                 "canvas_border": "#9baac0", "list_bg": "#ffffff", "entry": "#ffffff",
+                "danger": "#c4302b",
             }
         return {
             "bg": "#121421", "surface": "#1c2033", "surface_alt": "#252a43",
             "text": "#edf1ff", "muted": "#aab3cf", "accent": "#8b7cf6",
             "accent_text": "#ffffff", "border": "#3b4266", "canvas": "#101323",
             "canvas_border": "#59608a", "list_bg": "#171b2d", "entry": "#20253a",
+            "danger": "#ff6b6b",
         }
 
     def _configure_styles(self) -> None:
@@ -1178,6 +1292,9 @@ class APVDApp:
                     widget.configure(bg=palette["surface"], fg=palette["text"], troughcolor=palette["surface_alt"], highlightthickness=0, activebackground=palette["accent"])
                 elif role == "spinbox":
                     widget.configure(bg=palette["entry"], fg=palette["text"], buttonbackground=palette["surface_alt"], insertbackground=palette["text"], highlightbackground=palette["border"])
+                elif role == "resource_prediction":
+                    is_warning = getattr(widget, "_resource_warning_active", False)
+                    widget.configure(bg=palette["surface"], fg=(palette["danger"] if is_warning else palette["muted"]))
             except tk.TclError:
                 continue
 
@@ -1521,17 +1638,40 @@ class APVDApp:
             return requested_total
         return max(1, requested_total // loader_workers)
 
+    @staticmethod
+    def _resolve_effective_prefetch_per_worker(requested_total_in_flight: int, loader_workers: int, *, max_total_in_flight: int = 256) -> int:
+        """Shared by the real DataLoader builder and the live resource-prediction
+        panel, so the two can never silently disagree about what a given UI value
+        actually does. See _build_training_dataloader for the full rationale."""
+        if loader_workers <= 0:
+            return 0
+        requested_total_in_flight = max(1, int(requested_total_in_flight))
+        per_worker = max(2, requested_total_in_flight // loader_workers)
+        if per_worker * loader_workers > max_total_in_flight:
+            per_worker = max(2, max_total_in_flight // loader_workers)
+        return per_worker
+
     def _build_training_dataloader(self, dataset: Dataset, *, batch_size: int, loader_workers: int, prefetch_batches: int, shuffle: bool = True) -> DataLoader:
         cuda_enabled = getattr(self.device, "type", "") == "cuda"
         loader_kwargs = {"batch_size": batch_size, "shuffle": shuffle, "num_workers": loader_workers, "pin_memory": cuda_enabled}
+        effective_prefetch_factor = None
         if loader_workers > 0:
-            loader_kwargs.update({"persistent_workers": True, "prefetch_factor": prefetch_batches})
+            # IMPORTANT: PyTorch's prefetch_factor is PER WORKER, not a total.
+            # "prefetch_batches" in our UI is meant to represent the TOTAL number
+            # of batches held in flight across all workers combined (this is the
+            # intuitive meaning given how the setting is presented to the user).
+            # We convert it here so a UI value of e.g. 256 means "256 batches total
+            # in flight," not "256 batches per worker" (which silently multiplies
+            # by worker count and can request tens of GB of pinned memory).
+            effective_prefetch_factor = self._resolve_effective_prefetch_per_worker(prefetch_batches, loader_workers)
+            loader_kwargs.update({"persistent_workers": True, "prefetch_factor": effective_prefetch_factor})
         logger.info(
-            "Building DataLoader: samples=%s batch=%s workers=%s prefetch=%s cache_per_worker=%s",
+            "Building DataLoader: samples=%s batch=%s workers=%s prefetch_per_worker=%s (~%s total in flight) cache_per_worker=%s",
             len(dataset),
             batch_size,
             loader_workers,
-            prefetch_batches if loader_workers > 0 else 0,
+            effective_prefetch_factor or 0,
+            (effective_prefetch_factor * loader_workers) if effective_prefetch_factor else 0,
             getattr(dataset, "cache_limit", 0),
         )
         return DataLoader(dataset, **loader_kwargs)
@@ -1666,6 +1806,141 @@ class APVDApp:
             else:
                 self.status_var.set(f"Training intensity set to {percent}%: data loading tuned down and GPU work throttled between batches.")
 
+    def _system_memory_totals(self) -> tuple[float | None, float | None]:
+        """Returns (total_ram_gb, available_ram_gb), or (None, None) if psutil is unavailable."""
+        if psutil is None:
+            return None, None
+        try:
+            vm = psutil.virtual_memory()
+            return vm.total / (1024 ** 3), vm.available / (1024 ** 3)
+        except Exception:
+            return None, None
+
+    def _system_vram_total_gb(self) -> float | None:
+        if getattr(self.device, "type", "") != "cuda" or not torch.cuda.is_available():
+            return None
+        try:
+            return torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 ** 3)
+        except Exception:
+            return None
+
+    def _update_resource_prediction(self, *_args) -> None:
+        """Recompute the live RAM/VRAM/time estimate shown under Data Loading.
+        Bound to every setting that affects memory or throughput, so it updates
+        the moment the user changes anything — before they ever hit Train."""
+        if not hasattr(self, "resource_prediction_var"):
+            return
+        try:
+            batch_size = max(1, int(self.batch_size_var.get()))
+            resolution = max(32, int(self.resolution_var.get()))
+            loader_workers = max(0, int(self.loader_workers_var.get()))
+            prefetch_requested = max(1, int(self.prefetch_batches_var.get()))
+            dataset_cache_items = max(0, int(self.dataset_cache_items_var.get()))
+            is_wavelet = self._is_wavelet_mode()
+            in_channels = 12 if is_wavelet else 3
+            precision = self._resolve_precision_settings()
+            dtype_label = str(precision.get("dtype_label", "fp32"))
+        except (tk.TclError, ValueError):
+            # Spinbox is mid-edit (e.g. briefly empty) — skip this update, the next
+            # keystroke/trace will retry.
+            return
+
+        effective_prefetch_per_worker = self._resolve_effective_prefetch_per_worker(prefetch_requested, loader_workers)
+        ram_estimate = estimate_training_ram_bytes(
+            batch_size=batch_size, resolution=resolution, in_channels=in_channels,
+            effective_prefetch_per_worker=effective_prefetch_per_worker, loader_workers=loader_workers,
+            dataset_cache_items=dataset_cache_items,
+        )
+        vram_estimate = estimate_training_vram_bytes(
+            batch_size=batch_size, resolution=resolution, in_channels=in_channels,
+            latent_dim=256, dtype_label=dtype_label,
+        )
+        seconds_per_batch = estimate_seconds_per_batch(
+            batch_size=batch_size, resolution=resolution, device_type=getattr(self.device, "type", "cpu"),
+        )
+        try:
+            n_epochs = max(1, int(self.epochs_var.get()))
+        except (tk.TclError, ValueError):
+            n_epochs = 1
+
+        known_image_count = len(self.training_paths or []) + len(self.archive_entries or [])
+        dataset_size_is_known = known_image_count > 0
+        if dataset_size_is_known:
+            approx_batches_per_epoch = max(1, math.ceil(known_image_count / batch_size))
+        else:
+            approx_batches_per_epoch = 50  # nothing selected yet — placeholder so the field isn't blank
+        rough_total_seconds = seconds_per_batch * approx_batches_per_epoch * n_epochs
+
+        predicted_ram_gb = ram_estimate["total_ram_bytes"] / (1024 ** 3)
+        predicted_vram_gb = vram_estimate["estimated_total_bytes"] / (1024 ** 3)
+        total_ram_gb, available_ram_gb = self._system_memory_totals()
+        total_vram_gb = self._system_vram_total_gb()
+
+        ram_part = f"Est. RAM: ~{predicted_ram_gb:.1f} GB"
+        if total_ram_gb is not None:
+            ram_part += f" / {total_ram_gb:.0f} GB total"
+        else:
+            ram_part += " (install psutil for total-RAM comparison)"
+
+        vram_part = "Est. VRAM: n/a (CPU mode)"
+        if total_vram_gb is not None:
+            vram_part = f"Est. VRAM: ~{predicted_vram_gb:.1f} GB / {total_vram_gb:.0f} GB total"
+        elif getattr(self.device, "type", "") == "cuda":
+            vram_part = f"Est. VRAM: ~{predicted_vram_gb:.1f} GB (total VRAM unknown)"
+
+        dataset_note = "" if dataset_size_is_known else " (no dataset selected yet — using a generic placeholder size)"
+        time_part = (
+            f"Rough total time: ~{self._format_duration(rough_total_seconds)} for {n_epochs} epoch(s) "
+            f"(~{self._format_duration(seconds_per_batch * approx_batches_per_epoch)}/epoch){dataset_note}. "
+            "Approximate — actual speed depends on hardware; once training starts, "
+            "the status bar's live ETA will be far more accurate."
+        )
+
+        over_ram = total_ram_gb is not None and predicted_ram_gb > total_ram_gb * 0.85
+        over_vram = total_vram_gb is not None and predicted_vram_gb > total_vram_gb * 0.85
+
+        warning_text = ""
+        if over_ram or over_vram:
+            culprits = []
+            if over_ram:
+                culprits.append("RAM")
+            if over_vram:
+                culprits.append("VRAM")
+            warning_text = f"\n⚠ These settings may exceed available {' and '.join(culprits)} and could crash training. Consider lowering Batch Loads, Prefetch Batches, Dataset Cache, batch size, or resolution."
+
+        self.resource_prediction_var.set(f"{ram_part}  |  {vram_part}\n{time_part}{warning_text}")
+
+        if hasattr(self, "resource_prediction_label"):
+            self.resource_prediction_label._resource_warning_active = bool(over_ram or over_vram)
+            palette = self._theme_palette
+            fg = palette["danger"] if (over_ram or over_vram) else palette["muted"]
+            try:
+                self.resource_prediction_label.configure(fg=fg)
+            except tk.TclError:
+                pass
+
+    def _queue_resource_prediction_update(self, *_args) -> None:
+        if self._closing:
+            return
+        if self._resource_prediction_after_id is not None:
+            try:
+                self.root.after_cancel(self._resource_prediction_after_id)
+            except tk.TclError:
+                pass
+        self._resource_prediction_after_id = self.root.after(200, self._update_resource_prediction)
+
+    def _install_resource_prediction_traces(self) -> None:
+        watched_vars = (
+            self.batch_size_var, self.resolution_var, self.loader_workers_var,
+            self.prefetch_batches_var, self.dataset_cache_items_var, self.epochs_var,
+            self.precision_mode_var, self.reconstruction_mode_var,
+        )
+        for var in watched_vars:
+            try:
+                var.trace_add("write", self._queue_resource_prediction_update)
+            except Exception:
+                pass
+
     def _refresh_hardware_status(self) -> None:
         choice = self._device_choice_from_device(self.device)
         if self.device_choice_var.get() != choice:
@@ -1744,6 +2019,7 @@ class APVDApp:
             self._refresh_hardware_status()
             if hasattr(self, "status_var"):
                 self.status_var.set(f"Hardware switched to {choice}.")
+            self._update_resource_prediction()
         except Exception as exc:
             messagebox.showerror("Hardware", str(exc))
             self._refresh_hardware_status()
@@ -2203,6 +2479,7 @@ Hardware Status
         self._grid_row(training_frame, 11, "Batch Loads:", self.loader_spin)
         self.prefetch_spin = ttk.Spinbox(training_frame, from_=1, to=512, increment=1, width=8, textvariable=self.prefetch_batches_var)
         self._grid_row(training_frame, 11, "Prefetch Batches:", self.prefetch_spin, column=2)
+        ttk.Label(training_frame, text="Total batches kept ready across all workers combined (not per-worker). Higher = smoother but more RAM.", style="SurfaceMuted.TLabel").grid(row=11, column=4, columnspan=2, sticky=tk.W, pady=4)
         cache_spin = ttk.Spinbox(training_frame, from_=0, to=200000, increment=512, width=8, textvariable=self.dataset_cache_items_var)
         self._grid_row(training_frame, 12, "Dataset Cache:", cache_spin)
         ttk.Label(training_frame, text="Approx. total decoded/resized images kept warm in RAM; split across workers.", style="SurfaceMuted.TLabel").grid(row=12, column=2, columnspan=3, sticky=tk.W, pady=4)
@@ -2212,11 +2489,17 @@ Hardware Status
         ttk.Checkbutton(training_frame, text="Blend memory into training", variable=self.include_memory_training_var).grid(row=14, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         memory_limit_spin = ttk.Spinbox(training_frame, from_=0, to=10000, increment=8, width=8, textvariable=self.memory_training_limit_var)
         self._grid_row(training_frame, 14, "Memory Images:", memory_limit_spin, column=2, pad_y=8)
-        self._category_label(training_frame, "Video Sampling", 15)
+        self.resource_prediction_label = tk.Label(
+            training_frame, textvariable=self.resource_prediction_var, justify=tk.LEFT, anchor=tk.W,
+            wraplength=620, font=("", 9),
+        )
+        self.resource_prediction_label.grid(row=15, column=0, columnspan=6, sticky=tk.W, padx=(0, 8), pady=(2, 8))
+        self._register_theme_widget(self.resource_prediction_label, "resource_prediction")
+        self._category_label(training_frame, "Video Sampling", 16)
         video_stride_spin = ttk.Spinbox(training_frame, from_=1, to=10000, increment=1, width=8, textvariable=self.video_stride_var)
-        self._grid_row(training_frame, 16, "Video Stride:", video_stride_spin)
+        self._grid_row(training_frame, 17, "Video Stride:", video_stride_spin)
         max_frames_spin = ttk.Spinbox(training_frame, from_=0, to=1_000_000, increment=100, width=8, textvariable=self.video_max_frames_var)
-        self._grid_row(training_frame, 16, "Max Frames:", max_frames_spin, column=2)
+        self._grid_row(training_frame, 17, "Max Frames:", max_frames_spin, column=2)
 
         gen_tools_frame = self._make_section(content, "Generation Tools", open_by_default=True)
         self._category_label(gen_tools_frame, "Generate And Cycle", 0)
@@ -3182,6 +3465,7 @@ Hardware Status
         self.batch_training_root = None
         self.batch_training_folders = []
         self.status_var.set(f"Selected {len(self.training_paths)} images.")
+        self._update_resource_prediction()
 
     def _select_videos(self):
         paths = filedialog.askopenfilenames(title="Select training video(s)", filetypes=self.VIDEO_FILE_TYPES)
@@ -3189,6 +3473,7 @@ Hardware Status
             return
         self.video_paths = [Path(p) for p in paths]
         self.status_var.set(f"Selected {len(self.video_paths)} video file(s).")
+        self._update_resource_prediction()
 
     def _select_batch_folder(self):
         folder = filedialog.askdirectory(title="Select parent folder with dataset subfolders")
@@ -3206,6 +3491,7 @@ Hardware Status
         self.archive_entries = []
         self.video_paths = []
         self.status_var.set(f"Queued {len(dataset_folders)} dataset folder(s) for batch training.")
+        self._update_resource_prediction()
 
     def _select_archives(self):
         paths = filedialog.askopenfilenames(title="Select training archive(s)", filetypes=self.ARCHIVE_FILE_TYPES)
@@ -3225,6 +3511,7 @@ Hardware Status
             return
         self.archive_entries.extend(new_entries)
         self.status_var.set(f"Added {len(new_entries)} image(s) from {n_ok} archive(s).")
+        self._update_resource_prediction()
 
     def _clear_training_sources(self):
         self.training_paths = None
@@ -3234,6 +3521,7 @@ Hardware Status
         self.archive_entries = []
         self.video_paths = []
         self.status_var.set("Cleared image/video/archive sources.")
+        self._update_resource_prediction()
 
     def _select_folder(self):
         folder = filedialog.askdirectory(title="Select folder with training images")
@@ -3247,6 +3535,7 @@ Hardware Status
         self.batch_training_folders = []
         self.training_paths = paths
         self.status_var.set(f"Found {len(paths)} images in folder.")
+        self._update_resource_prediction()
 
     def _export_reconstruction_video(self):
         frame_paths = filedialog.askopenfilenames(title="Select ordered latent traversal frames", filetypes=self.FILE_TYPES, parent=self.root)
@@ -3313,6 +3602,132 @@ Hardware Status
             self._after(0, lambda: (self.status_var.set(f"Saved reconstruction video: {result.output_path.name} ({result.duration_seconds:.1f}s, {codec_note}{audio_note})."), messagebox.showinfo("Reconstruction Video", f"Saved video to:\n{result.output_path}\n\nDuration: {result.duration_seconds:.1f}s\nCodec: {codec_note}", parent=self.root)))
 
         threading.Thread(target=render_job, daemon=True).start()
+
+    def _check_for_crash_recovery(self) -> None:
+        """Called shortly after startup. If the previous session left behind a
+        crash checkpoint that was never cleanly cleared, offer to resume."""
+        try:
+            if not CRASH_STATE_PATH.exists():
+                return
+            with open(CRASH_STATE_PATH, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            return
+
+        if state.get("status") != "in_progress":
+            return
+
+        checkpoint, used_path = self._load_best_available_crash_checkpoint()
+        if checkpoint is None:
+            self._clear_crash_checkpoints()
+            return
+
+        epoch = int(checkpoint.get("epoch", 0))
+        batch_idx = int(checkpoint.get("batch_idx", 0))
+        total_batches = int(checkpoint.get("total_batches", 0))
+        n_epochs = int(checkpoint.get("n_epochs", 1))
+        dataset_label = str(checkpoint.get("dataset_label", "dataset"))
+
+        proceed = messagebox.askyesno(
+            "Resume Training?",
+            "It looks like training didn't finish cleanly last time.\n\n"
+            f"Last saved progress: \"{dataset_label}\" — Epoch {epoch + 1}/{n_epochs}, "
+            f"Batch {batch_idx}/{total_batches}.\n\n"
+            "Resume from this point?",
+            parent=self.root,
+        )
+        if not proceed:
+            self._clear_crash_checkpoints()
+            return
+
+        self._resume_from_crash_checkpoint(checkpoint, used_path)
+
+    def _load_best_available_crash_checkpoint(self) -> tuple[dict | None, Path | None]:
+        """Try each rotation slot newest-first; if a slot is corrupted (e.g. the
+        process died mid-write before the atomic rename even completed), fall
+        back to the next-older slot."""
+        for slot in CRASH_CHECKPOINT_SLOTS:
+            if not slot.exists():
+                continue
+            try:
+                checkpoint = load_crash_checkpoint(slot, map_location="cpu")
+                if isinstance(checkpoint, dict) and checkpoint.get("checkpoint_kind") == "crash_recovery":
+                    return checkpoint, slot
+            except Exception:
+                continue
+        return None, None
+
+    def _resume_from_crash_checkpoint(self, checkpoint: dict, source_path: Path | None) -> None:
+        try:
+            mode = checkpoint.get("reconstruction_mode", "RGB VAE")
+            self.reconstruction_mode_var.set(mode if mode in ("RGB VAE", "Wavelet") else "RGB VAE")
+
+            in_ch = int(checkpoint.get("in_channels", 12 if mode == "Wavelet" else 3))
+            out_ch = int(checkpoint.get("out_channels", 12 if mode == "Wavelet" else 3))
+            output_size = tuple(checkpoint.get("output_size", (256, 256)))
+            output_activation = checkpoint.get("output_activation", "identity" if mode == "Wavelet" else "sigmoid")
+
+            resumed_model = VAE(
+                latent_dim=checkpoint.get("latent_dim", 256),
+                in_channels=in_ch,
+                out_channels=out_ch,
+                output_size=output_size,
+                output_activation=output_activation,
+            ).to(self.device)
+            resumed_model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+            with self.model_lock:
+                self.model = resumed_model
+                self.loaded_model_path = None
+
+            resolution = int(checkpoint.get("resolution", int(self.resolution_var.get())))
+            self.resolution_var.set(resolution)
+            self.learning_rate_var.set(float(checkpoint.get("learning_rate", float(self.learning_rate_var.get()))))
+            self.epochs_var.set(int(checkpoint.get("n_epochs", int(self.epochs_var.get()))))
+
+            training_paths = [Path(p) for p in checkpoint.get("training_paths", [])]
+            archive_entries = [(Path(p), tag) for p, tag in checkpoint.get("archive_entries", [])]
+            video_paths = [Path(p) for p in checkpoint.get("video_paths", [])]
+
+            resume_state = {
+                "epoch": int(checkpoint.get("epoch", 0)),
+                "batch_idx": int(checkpoint.get("batch_idx", 0)),
+                "optimizer_state_dict": checkpoint.get("optimizer_state_dict"),
+            }
+
+            self.is_training = True
+            self.training_pause_event.set()
+            self.train_btn.config(state=tk.DISABLED)
+            self.pause_btn.config(state=tk.NORMAL, text="Pause Training")
+            self.stop_btn.config(state=tk.NORMAL)
+
+            def _resumed_training_loop():
+                try:
+                    self._train_dataset(
+                        n_epochs=int(checkpoint.get("n_epochs", 1)),
+                        resolution=resolution,
+                        dataset_label=str(checkpoint.get("dataset_label", "Current dataset")),
+                        training_paths=training_paths,
+                        archive_entries=archive_entries,
+                        video_paths=video_paths,
+                        reset_model=False,
+                        batch_index=checkpoint.get("batch_index"),
+                        batch_total=checkpoint.get("batch_total"),
+                        resume_state=resume_state,
+                    )
+                except Exception as e:
+                    error_message = str(e)
+                    self._after(0, lambda msg=error_message: messagebox.showerror("Error", msg))
+                finally:
+                    self._clear_crash_checkpoints()
+                self._finish_training()
+
+            self.training_thread = threading.Thread(target=_resumed_training_loop, daemon=True)
+            self.training_thread.start()
+            self.status_var.set(f"Resuming training from epoch {resume_state['epoch'] + 1}, batch {resume_state['batch_idx']}...")
+        except Exception as e:
+            messagebox.showerror("Resume Failed", f"Could not resume training: {e}")
+            self._clear_crash_checkpoints()
 
     def _train(self):
         has_batch_folders = bool(self.batch_training_folders)
@@ -3403,6 +3818,103 @@ Hardware Status
         if self.model_map_window is not None and self.model_map_window.winfo_exists():
             self._refresh_model_map()
 
+    def _build_crash_checkpoint(
+        self,
+        *,
+        optimizer: "torch.optim.Optimizer",
+        epoch: int,
+        batch_idx: int,
+        total_batches: int,
+        n_epochs: int,
+        dataset_label: str,
+        resolution: int,
+        learning_rate: float,
+        training_paths: list[Path],
+        archive_entries: list[tuple[Path, str]],
+        video_paths: list[Path],
+        reset_model: bool,
+        batch_index: int | None,
+        batch_total: int | None,
+    ) -> dict:
+        """Build a resumable crash checkpoint: weights + optimizer state + exact position."""
+        base = self._build_model_checkpoint()
+        base.update({
+            "checkpoint_kind": "crash_recovery",
+            "checkpoint_version": 1,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "batch_idx": batch_idx,
+            "total_batches": total_batches,
+            "n_epochs": n_epochs,
+            "dataset_label": dataset_label,
+            "resolution": resolution,
+            "learning_rate": learning_rate,
+            "training_paths": [str(p) for p in training_paths],
+            "archive_entries": [[str(p), tag] for p, tag in archive_entries],
+            "video_paths": [str(p) for p in video_paths],
+            "reset_model": reset_model,
+            "batch_index": batch_index,
+            "batch_total": batch_total,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        return base
+
+    def _save_rolling_crash_checkpoint(self, payload: dict) -> None:
+        """Atomically write a new crash checkpoint and rotate the 3-slot ring buffer.
+
+        Slot 1 = newest, slot 3 = oldest. The file actively being written is always
+        a temp file that gets renamed into place only after a complete, successful
+        write, so an interrupted save can never corrupt an existing slot.
+        """
+        try:
+            CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Shift slots back-to-front so nothing is overwritten before it's moved:
+            # delete oldest (slot 3), then 2->3, then 1->2, leaving slot 1 free for the new save.
+            oldest = CRASH_CHECKPOINT_SLOTS[2]
+            if oldest.exists():
+                oldest.unlink(missing_ok=True)
+            for i in range(len(CRASH_CHECKPOINT_SLOTS) - 1, 0, -1):
+                src = CRASH_CHECKPOINT_SLOTS[i - 1]
+                dst = CRASH_CHECKPOINT_SLOTS[i]
+                if src.exists():
+                    os.replace(src, dst)
+
+            target = CRASH_CHECKPOINT_SLOTS[0]
+            tmp_path = target.with_suffix(target.suffix + ".tmp")
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, target)
+
+            self._write_crash_state(status="in_progress", latest_slot=str(target))
+        except Exception:
+            # A failed backup must never take down training itself.
+            tmp_candidate = CRASH_CHECKPOINT_SLOTS[0].with_suffix(CRASH_CHECKPOINT_SLOTS[0].suffix + ".tmp")
+            if tmp_candidate.exists():
+                tmp_candidate.unlink(missing_ok=True)
+
+    def _write_crash_state(self, *, status: str, latest_slot: str | None = None) -> None:
+        try:
+            CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+            state = {"status": status, "updated_at": datetime.now().isoformat(timespec="seconds")}
+            if latest_slot is not None:
+                state["latest_slot"] = latest_slot
+            tmp_path = CRASH_STATE_PATH.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            os.replace(tmp_path, CRASH_STATE_PATH)
+        except Exception:
+            pass
+
+    def _clear_crash_checkpoints(self) -> None:
+        """Called on clean training completion/stop so stale checkpoints don't
+        trigger a resume prompt next launch."""
+        try:
+            for slot in CRASH_CHECKPOINT_SLOTS:
+                slot.unlink(missing_ok=True)
+            CRASH_STATE_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     @staticmethod
     def _sample_training_preview(tensors: torch.Tensor, max_items: int) -> torch.Tensor:
         if tensors.size(0) <= max_items:
@@ -3421,8 +3933,9 @@ Hardware Status
         reset_model: bool = False,
         batch_index: int | None = None,
         batch_total: int | None = None,
+        resume_state: dict | None = None,
     ) -> bool:
-        if reset_model:
+        if reset_model and resume_state is None:
             with self.model_lock:
                 self.model = None
                 self.loaded_model_path = None
@@ -3441,7 +3954,7 @@ Hardware Status
         output_activation = "identity" if is_wavelet else "sigmoid"
 
         with self.model_lock:
-            if (
+            if resume_state is None and (
                 self.model is None
                 or getattr(self.model, "output_size", model_output_size) != model_output_size
                 or int(getattr(self.model, "in_channels", 3)) != in_channels
@@ -3492,6 +4005,13 @@ Hardware Status
 
         data_loader = self._build_training_dataloader(dataset, batch_size=batch_size, loader_workers=loader_workers, prefetch_batches=prefetch_batches, shuffle=True)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
+        if resume_state is not None and resume_state.get("optimizer_state_dict") is not None:
+            try:
+                optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            except Exception:
+                # Optimizer state mismatch (e.g. architecture changed) — fall back to
+                # a fresh optimizer rather than failing the whole resume.
+                pass
         scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
         self.model.train()
         train_start = time.perf_counter()
@@ -3500,6 +4020,11 @@ Hardware Status
         total_steps = max(1, n_epochs * total_batches)
         completed_steps = 0
         total_training_images = len(dataset)
+
+        resume_epoch = int(resume_state.get("epoch", 0)) if resume_state is not None else 0
+        resume_skip_batches = int(resume_state.get("batch_idx", 0)) if resume_state is not None else 0
+        if resume_state is not None:
+            completed_steps = min(total_steps, resume_epoch * total_batches + resume_skip_batches)
 
         self._after(0, lambda: self.load_progress_var.set(0.0))
         self._after(0, lambda p=str(precision["requested"]), r=str(precision["resolved"]), lm=loss_mode: self.status_var.set((f"Training using precision: {p} → {r}" if p == "Auto Recommended" else f"Training using precision: {r}") + f" | Loss: {lm}."))
@@ -3511,14 +4036,18 @@ Hardware Status
         if prefix:
             prefix += " "
 
-        for epoch in range(n_epochs):
+        for epoch in range(resume_epoch, n_epochs):
             if not self.is_training:
                 return False
             if not self._wait_if_training_paused():
                 return False
 
+            skip_in_this_epoch = resume_skip_batches if epoch == resume_epoch else 0
             epoch_loss = 0.0
+            processed_in_epoch = 0
             for batch_idx, batch in enumerate(data_loader, start=1):
+                if batch_idx <= skip_in_this_epoch:
+                    continue
                 if not self.is_training:
                     return False
                 if not self._wait_if_training_paused():
@@ -3568,6 +4097,17 @@ Hardware Status
                 scaler.step(optimizer)
                 scaler.update()
                 epoch_loss += loss.detach().float().item()
+                processed_in_epoch += 1
+
+                crash_payload = self._build_crash_checkpoint(
+                    optimizer=optimizer, epoch=epoch, batch_idx=batch_idx,
+                    total_batches=total_batches, n_epochs=n_epochs,
+                    dataset_label=dataset_label, resolution=resolution,
+                    learning_rate=learning_rate, training_paths=image_paths,
+                    archive_entries=archive_entries, video_paths=video_paths,
+                    reset_model=reset_model, batch_index=batch_index, batch_total=batch_total,
+                )
+                self._save_rolling_crash_checkpoint(crash_payload)
 
                 completed_steps += 1
                 if training_intensity < 100 and throttle_cap > 0.0:
@@ -3578,7 +4118,7 @@ Hardware Status
                 progress = min(100.0, (completed_steps / total_steps) * 100.0)
                 elapsed = time.perf_counter() - train_start
                 eta = (total_steps - completed_steps) * (elapsed / max(1, completed_steps))
-                running_avg = epoch_loss / max(1, batch_idx)
+                running_avg = epoch_loss / max(1, processed_in_epoch)
                 metrics = {
                     "dataset_label": dataset_label, "epoch": epoch + 1, "epochs": n_epochs,
                     "batch": batch_idx, "total_batches": total_batches, "loss": running_avg,
@@ -3590,7 +4130,7 @@ Hardware Status
                 if batch_idx == 1 or batch_idx % 350 == 0 or batch_idx == total_batches:
                     self._after(0, lambda e=epoch, b=batch_idx, a=running_avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(f"{p}{label} | Epoch {e+1}/{n_epochs} | Batch {b}/{total_batches} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"))
 
-            avg = epoch_loss / total_batches
+            avg = epoch_loss / max(1, processed_in_epoch)
             elapsed = time.perf_counter() - train_start
             eta = (n_epochs - (epoch + 1)) * (elapsed / max(1, epoch + 1))
             self._after(0, lambda e=epoch, a=avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(f"{p}{label} | Epoch {e+1}/{n_epochs} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"))
@@ -3681,6 +4221,7 @@ Hardware Status
                 self._after(0, lambda: self.status_var.set("Training stopped."))
             if self.timelapse_frames_dir is not None:
                 self._finish_timelapse_session()
+            self._clear_crash_checkpoints()
         self._finish_training()
 
     def _finish_training(self):
