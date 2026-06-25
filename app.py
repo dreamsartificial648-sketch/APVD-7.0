@@ -3623,16 +3623,22 @@ Hardware Status
             return
 
         epoch = int(checkpoint.get("epoch", 0))
-        batch_idx = int(checkpoint.get("batch_idx", 0))
-        total_batches = int(checkpoint.get("total_batches", 0))
         n_epochs = int(checkpoint.get("n_epochs", 1))
         dataset_label = str(checkpoint.get("dataset_label", "dataset"))
+
+        if epoch >= n_epochs:
+            # The crash happened after the very last epoch finished but before the
+            # session was marked clean (e.g. closed during post-training save) —
+            # there's nothing left to resume.
+            self._clear_crash_checkpoints()
+            return
 
         proceed = messagebox.askyesno(
             "Resume Training?",
             "It looks like training didn't finish cleanly last time.\n\n"
-            f"Last saved progress: \"{dataset_label}\" — Epoch {epoch + 1}/{n_epochs}, "
-            f"Batch {batch_idx}/{total_batches}.\n\n"
+            f"\"{dataset_label}\" completed {epoch}/{n_epochs} epoch(s). "
+            f"Checkpoints are saved once per epoch, so resuming will continue from "
+            f"the start of epoch {epoch + 1}.\n\n"
             "Resume from this point?",
             parent=self.root,
         )
@@ -3724,7 +3730,7 @@ Hardware Status
 
             self.training_thread = threading.Thread(target=_resumed_training_loop, daemon=True)
             self.training_thread.start()
-            self.status_var.set(f"Resuming training from epoch {resume_state['epoch'] + 1}, batch {resume_state['batch_idx']}...")
+            self.status_var.set(f"Resuming training from the start of epoch {resume_state['epoch'] + 1}...")
         except Exception as e:
             messagebox.showerror("Resume Failed", f"Could not resume training: {e}")
             self._clear_crash_checkpoints()
@@ -3836,7 +3842,11 @@ Hardware Status
         batch_index: int | None,
         batch_total: int | None,
     ) -> dict:
-        """Build a resumable crash checkpoint: weights + optimizer state + exact position."""
+        """Build a resumable crash checkpoint: weights + optimizer state + epoch position.
+        Saved once per completed epoch (not per batch) — see _train_dataset's epoch
+        loop for why per-batch saves were removed: AdamW's optimizer state roughly
+        doubles the save payload size, and writing that every batch turned disk I/O
+        into the actual training bottleneck, starving the GPU between batches."""
         base = self._build_model_checkpoint()
         base.update({
             "checkpoint_kind": "crash_recovery",
@@ -4099,16 +4109,6 @@ Hardware Status
                 epoch_loss += loss.detach().float().item()
                 processed_in_epoch += 1
 
-                crash_payload = self._build_crash_checkpoint(
-                    optimizer=optimizer, epoch=epoch, batch_idx=batch_idx,
-                    total_batches=total_batches, n_epochs=n_epochs,
-                    dataset_label=dataset_label, resolution=resolution,
-                    learning_rate=learning_rate, training_paths=image_paths,
-                    archive_entries=archive_entries, video_paths=video_paths,
-                    reset_model=reset_model, batch_index=batch_index, batch_total=batch_total,
-                )
-                self._save_rolling_crash_checkpoint(crash_payload)
-
                 completed_steps += 1
                 if training_intensity < 100 and throttle_cap > 0.0:
                     step_seconds = max(0.0, time.perf_counter() - step_start)
@@ -4134,6 +4134,20 @@ Hardware Status
             elapsed = time.perf_counter() - train_start
             eta = (n_epochs - (epoch + 1)) * (elapsed / max(1, epoch + 1))
             self._after(0, lambda e=epoch, a=avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(f"{p}{label} | Epoch {e+1}/{n_epochs} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"))
+
+            # Crash checkpoint once per epoch (not per batch): a full save includes
+            # AdamW's optimizer state (2x model size) and was costing far more time
+            # than the GPU compute itself when written every batch. Worst case on a
+            # crash, you lose progress within the epoch in flight, not the whole run.
+            crash_payload = self._build_crash_checkpoint(
+                optimizer=optimizer, epoch=epoch + 1, batch_idx=0,
+                total_batches=total_batches, n_epochs=n_epochs,
+                dataset_label=dataset_label, resolution=resolution,
+                learning_rate=learning_rate, training_paths=image_paths,
+                archive_entries=archive_entries, video_paths=video_paths,
+                reset_model=reset_model, batch_index=batch_index, batch_total=batch_total,
+            )
+            self._save_rolling_crash_checkpoint(crash_payload)
 
         if amp_enabled:
             torch.cuda.empty_cache()
