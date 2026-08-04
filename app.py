@@ -1,5 +1,5 @@
 """
-APVD v7.0 - AI Pixel Value Determinator
+APVD v7.1 - Memory Fragment Lab
 Tkinter GUI for VAE-based image variation generation with mini latent diffusion.
 Features:
 - Training controls (Epochs, Save/Load)
@@ -11,10 +11,13 @@ Features:
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
 import os
+import pathlib
+import pickle
 import platform
 import random
 import re
@@ -29,6 +32,8 @@ from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+import torch
+print(torch.cuda.is_available())
 
 try:
     import cv2
@@ -51,7 +56,7 @@ except Exception:
     psutil = None  # Resource prediction panel will show "unavailable" for RAM if this is missing.
 
 from memory_system import MemoryBank, breed_latents, parse_selection_indices, summarize_memory
-from model import VAE, vae_loss, latent_denoiser_loss, get_device
+from model import VAE, vae_loss, latent_denoiser_loss, pattern_decay_denoiser_loss, get_device
 from model_merger import merge_checkpoints
 from reconstruction_video import render_reconstruction_video
 from scene_composer import LayeredScene, ParsedScene, generate_scene_from_prompt
@@ -136,12 +141,62 @@ LOSS_MODE_CHOICES = [
     "Structure Stable",
     "Sharp Detail",
     "Experimental Structure",
+    "Multi Resolution Loss",
+    "Noise-to-Memory Loss",
+    "Edge Consistency Loss",
+    "Patch Consistency Loss",
 ]
 LOSS_MODE_HELP = {
     "Classic VAE": "Current APVD loss. Best for normal dream/generalized behavior.",
     "Structure Stable": "Adds gentle L1 shape pressure so objects stay more like themselves.",
     "Sharp Detail": "Adds L1 plus edge loss for stronger outlines and details.",
     "Experimental Structure": "Heavier structure mix using L1 and edge loss. Useful for cars/characters, but more experimental.",
+    "Multi Resolution Loss": "Compares reconstructions at several scales so the model learns global shape before tiny details.",
+    "Noise-to-Memory Loss": "Corrupts APVD latents and trains the built-in denoiser/decoder to recover the remembered image.",
+    "Edge Consistency Loss": "Adds stronger outline/border matching so UI, objects, and characters melt less.",
+    "Patch Consistency Loss": "Checks random local patches so grass, sky, UI, and character chunks stay more believable.",
+}
+EXPERIMENTAL_LAB_SECTION = "APVD 7.1 Lab"
+DECODER_MODE_CHOICES = [
+    "Standard Decoder",
+    "Hash Grid Assist",
+    "Coordinate Decoder (Future)",
+    "Hybrid Decoder (Future)",
+]
+PROGRESSIVE_MEMORY_MODE_CHOICES = ["Light", "Balanced", "Wild", "Custom"]
+PROGRESSIVE_MEMORY_PRESETS = {
+    "Light": {
+        "steps": 4,
+        "drift": 0.04,
+        "structure_pull": 0.55,
+        "novelty": 0.10,
+        "reflection_strength": 0.28,
+    },
+    "Balanced": {
+        "steps": 7,
+        "drift": 0.10,
+        "structure_pull": 0.35,
+        "novelty": 0.25,
+        "reflection_strength": 0.45,
+    },
+    "Wild": {
+        "steps": 10,
+        "drift": 0.18,
+        "structure_pull": 0.18,
+        "novelty": 0.45,
+        "reflection_strength": 0.62,
+    },
+}
+APVD_71_EXPERIMENT_FLAGS = {
+    "multi_resolution_loss": "Multi Resolution Loss",
+    "noise_to_memory_loss": "Noise-to-Memory Loss",
+    "edge_consistency_loss": "Edge Consistency Loss",
+    "patch_consistency_loss": "Patch Consistency Loss",
+    "structure_pyramid_denoise": "Structure Pyramid Denoise",
+    "progressive_memory_reconstruction": "Progressive Memory Reconstruction",
+    "pattern_decay_reconstruction": "Pattern Decay Reconstruction",
+    "memory_fragment_training": "Memory Fragment Training",
+    "hash_grid_assist": "Hash Grid Assist",
 }
 
 USER_LEVEL_CHOICES = ["Newbie", "Amateur", "Expert", "Nerd"]
@@ -153,8 +208,8 @@ USER_LEVEL_HELP = {
 }
 USER_LEVEL_SECTION_VISIBILITY = {
     "Newbie": {"Hardware", "Sources And Model", "Training Settings", "Preview"},
-    "Amateur": {"Hardware", "Sources And Model", "Training Settings", "Generation Tools", "Generation Settings", "Prompt And Personality", "Preview"},
-    "Expert": {"Hardware", "Sources And Model", "Training Settings", "Generation Tools", "Generation Settings", "Latent DDPM Diffusion", "Prompt And Personality", "Evolution And Memory", "Preview"},
+    "Amateur": {"Hardware", "Sources And Model", "Training Settings", EXPERIMENTAL_LAB_SECTION, "Generation Tools", "Generation Settings", "Prompt And Personality", "Preview"},
+    "Expert": {"Hardware", "Sources And Model", "Training Settings", EXPERIMENTAL_LAB_SECTION, "Generation Tools", "Generation Settings", "Latent DDPM Diffusion", "Prompt And Personality", "Evolution And Memory", "Preview"},
     "Nerd": "ALL",
 }
 
@@ -229,17 +284,42 @@ PERSONALITY_PRESETS = {
     },
 }
 
+try:
+    torch.serialization.add_safe_globals([
+        pathlib.Path, pathlib.PurePath,
+        pathlib.PosixPath, pathlib.WindowsPath,
+        pathlib.PurePosixPath, pathlib.PureWindowsPath,
+    ])
+except Exception:
+    # Older torch versions either don't have add_safe_globals (weights_only
+    # defaulted to False back then, so there's nothing to allowlist) or use a
+    # different API surface. Either way this is best-effort and safe_torch_load
+    # below has its own fallback if a checkpoint still fails to load.
+    logger.debug("Could not pre-register pathlib safe globals for torch.load.", exc_info=True)
+
 def safe_torch_load(path, *, map_location=None):
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError:
+        # This app only ever loads .pt files it produced itself (saved models,
+        # crash checkpoints) -- never third-party or downloaded files -- so the
+        # same trust model already used by load_crash_checkpoint applies here.
+        # A weights_only=True load can still fail on older files saved before
+        # training_metadata was sanitized (e.g. it embedded a raw pathlib.Path),
+        # or on any other legacy field weights_only doesn't allowlist. Falling
+        # back to weights_only=False recovers those files instead of treating
+        # them as unloadable.
+        logger.warning("weights_only load failed for %s; retrying with weights_only=False (local/trusted file only).", path)
+        return torch.load(path, map_location=map_location, weights_only=False)
 
 def load_crash_checkpoint(path, *, map_location=None):
     """Crash checkpoints are produced locally by this app and include optimizer
     state, so we always load with weights_only=False (no untrusted/remote files
     ever go through this path)."""
     return torch.load(path, map_location=map_location, weights_only=False)
+
 
 # --- Resource prediction -----------------------------------------------------
 # Bytes-per-element for the dtype actually used during the forward/backward pass.
@@ -539,7 +619,7 @@ class APVDApp:
         self._closing = False
         self._after_ids: set[str] = set()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
-        self.root.title("APVD v7.0 - AI Pixel Value Determinator")
+        self.root.title("APVD v7.1 - Memory Fragment Lab")
         self.root.geometry("800x1050")
         self.root.minsize(750, 1000)
 
@@ -571,6 +651,38 @@ class APVDApp:
         self.precision_mode_var = tk.StringVar(value="Auto Recommended")
         self.loss_mode_var = tk.StringVar(value="Classic VAE")
         self.loss_mode_help_var = tk.StringVar(value=LOSS_MODE_HELP["Classic VAE"])
+        self.multi_resolution_loss_var = tk.BooleanVar(value=False)
+        self.noise_to_memory_loss_var = tk.BooleanVar(value=False)
+        self.edge_consistency_loss_var = tk.BooleanVar(value=False)
+        self.patch_consistency_loss_var = tk.BooleanVar(value=False)
+        self.patch_loss_size_var = tk.IntVar(value=32)
+        self.patch_loss_samples_var = tk.IntVar(value=4)
+        self.structure_pyramid_denoise_var = tk.BooleanVar(value=False)
+        self.structure_pyramid_levels_var = tk.IntVar(value=3)
+        self.structure_pyramid_strength_var = tk.DoubleVar(value=0.35)
+        self.progressive_memory_var = tk.BooleanVar(value=False)
+        self.progressive_memory_mode_var = tk.StringVar(value="Balanced")
+        self.progressive_memory_steps_var = tk.IntVar(value=7)
+        self.progressive_memory_drift_var = tk.DoubleVar(value=0.10)
+        self.progressive_memory_structure_pull_var = tk.DoubleVar(value=0.35)
+        self.progressive_memory_novelty_var = tk.DoubleVar(value=0.25)
+        self.train_pattern_decay_var = tk.BooleanVar(value=False)
+        self.pattern_decay_reconstruction_var = tk.BooleanVar(value=False)
+        self.pattern_decay_steps_var = tk.IntVar(value=25)
+        self.pattern_decay_corruption_var = tk.DoubleVar(value=0.65)
+        self.pattern_decay_anchor_var = tk.DoubleVar(value=0.35)
+        self.pattern_decay_drift_var = tk.DoubleVar(value=0.15)
+        self.pattern_decay_final_cleanup_var = tk.BooleanVar(value=True)
+        self.memory_fragment_training_var = tk.BooleanVar(value=False)
+        self.fragment_strength_var = tk.DoubleVar(value=0.55)
+        self.fragment_noise_var = tk.DoubleVar(value=0.35)
+        self.fragment_blur_var = tk.DoubleVar(value=0.20)
+        self.fragment_color_drift_var = tk.DoubleVar(value=0.12)
+        self.fragment_mask_var = tk.DoubleVar(value=0.18)
+        self.fragment_crop_jitter_var = tk.DoubleVar(value=0.08)
+        self.decoder_mode_var = tk.StringVar(value="Standard Decoder")
+        self.hash_grid_size_var = tk.IntVar(value=32)
+        self.hash_grid_strength_var = tk.DoubleVar(value=0.08)
         self.resource_prediction_var = tk.StringVar(value="Estimated resource usage will appear here.")
         self.mixed_precision_var = tk.BooleanVar(value=True)
         self.nan_guard_var = tk.BooleanVar(value=True)
@@ -655,6 +767,7 @@ class APVDApp:
         self.training_thread: threading.Thread | None = None
         self.training_pause_event = threading.Event()
         self.training_pause_event.set()
+        self._dataloader_released_on_pause = False
         self.is_latent_diffusion_training = False
         self.is_dream_video_generating = False
         self.is_audio_memory_training = False
@@ -1317,7 +1430,24 @@ class APVDApp:
         names = [
             "epochs_var", "resolution_var", "batch_size_var", "loader_workers_var",
             "prefetch_batches_var", "dataset_cache_items_var", "training_intensity_var",
-            "learning_rate_var", "precision_mode_var", "loss_mode_var", "mixed_precision_var",
+            "learning_rate_var", "precision_mode_var", "loss_mode_var",
+            "multi_resolution_loss_var", "noise_to_memory_loss_var",
+            "edge_consistency_loss_var", "patch_consistency_loss_var",
+            "patch_loss_size_var", "patch_loss_samples_var",
+            "structure_pyramid_denoise_var", "structure_pyramid_levels_var",
+            "structure_pyramid_strength_var", "progressive_memory_var",
+            "progressive_memory_mode_var", "progressive_memory_steps_var",
+            "progressive_memory_drift_var", "progressive_memory_structure_pull_var",
+            "progressive_memory_novelty_var", "train_pattern_decay_var",
+            "pattern_decay_reconstruction_var", "pattern_decay_steps_var",
+            "pattern_decay_corruption_var", "pattern_decay_anchor_var",
+            "pattern_decay_drift_var", "pattern_decay_final_cleanup_var",
+            "memory_fragment_training_var", "fragment_strength_var", "fragment_noise_var",
+            "fragment_blur_var", "fragment_color_drift_var", "fragment_mask_var",
+            "fragment_crop_jitter_var",
+            "decoder_mode_var",
+            "hash_grid_size_var", "hash_grid_strength_var",
+            "mixed_precision_var",
             "nan_guard_var", "video_stride_var", "video_max_frames_var", "iterations_var",
             "show_iterations_var", "auto_cycle_var", "dream_cycle_var", "blend_mode_var",
             "blend_count_var", "output_count_var", "use_mini_diffusion_var",
@@ -1370,6 +1500,8 @@ class APVDApp:
                     if name == "theme_mode_var" and value not in ("Auto", "Day", "Night"):
                         continue
                     if name == "reconstruction_mode_var" and value not in ("RGB VAE", "Wavelet"):
+                        continue
+                    if name == "progressive_memory_mode_var" and value not in PROGRESSIVE_MEMORY_MODE_CHOICES:
                         continue
                     var.set(value)
                 except Exception:
@@ -1686,6 +1818,83 @@ class APVDApp:
         if hasattr(self, "status_var"):
             self.status_var.set(f"Loss mode set to {mode}.")
 
+    def _on_decoder_mode_changed(self, *_args) -> None:
+        mode = self.decoder_mode_var.get() if hasattr(self, "decoder_mode_var") else "Standard Decoder"
+        if mode not in DECODER_MODE_CHOICES:
+            mode = "Standard Decoder"
+            self.decoder_mode_var.set(mode)
+        if mode in {"Coordinate Decoder (Future)", "Hybrid Decoder (Future)"}:
+            self.decoder_mode_var.set("Standard Decoder")
+            if hasattr(self, "status_var"):
+                self.status_var.set(f"{mode} is still reserved for Phase 3. Staying on Standard Decoder.")
+            return
+        if hasattr(self, "status_var"):
+            if mode == "Hash Grid Assist":
+                self.status_var.set("Decoder mode set to Hash Grid Assist. It is checkpoint-safe, but it works best after fine-tuning/retraining.")
+            else:
+                self.status_var.set("Decoder mode set to Standard Decoder.")
+
+    def _on_progressive_memory_mode_changed(self, *_args) -> None:
+        mode = self.progressive_memory_mode_var.get() if hasattr(self, "progressive_memory_mode_var") else "Balanced"
+        if mode not in PROGRESSIVE_MEMORY_MODE_CHOICES:
+            mode = "Balanced"
+            self.progressive_memory_mode_var.set(mode)
+        if mode in PROGRESSIVE_MEMORY_PRESETS:
+            preset = PROGRESSIVE_MEMORY_PRESETS[mode]
+            self.progressive_memory_steps_var.set(int(preset["steps"]))
+            self.progressive_memory_drift_var.set(float(preset["drift"]))
+            self.progressive_memory_structure_pull_var.set(float(preset["structure_pull"]))
+            self.progressive_memory_novelty_var.set(float(preset["novelty"]))
+        if hasattr(self, "status_var"):
+            if mode == "Custom":
+                self.status_var.set("Progressive Memory set to Custom. Manual reflection controls are active.")
+            else:
+                self.status_var.set(f"Progressive Memory preset applied: {mode}.")
+
+    def _progressive_memory_reflection_strength(self) -> float:
+        mode = self.progressive_memory_mode_var.get() if hasattr(self, "progressive_memory_mode_var") else "Balanced"
+        if mode in PROGRESSIVE_MEMORY_PRESETS:
+            return float(PROGRESSIVE_MEMORY_PRESETS[mode]["reflection_strength"])
+        # Custom uses a balanced base; the manual sliders still control drift,
+        # pull, novelty, and step count.
+        return 0.45
+
+    def _experimental_loss_modules(self, loss_mode: str | None = None) -> dict[str, bool]:
+        """Return independent APVD 7.1 training modules.
+
+        The old Loss Mode combobox still works, but the lab checkboxes can stack
+        extra experiments on top of it. Disabled means the training path is the
+        old APVD behavior, so legacy checkpoints remain compatible.
+        """
+        mode = loss_mode or (self.loss_mode_var.get() if hasattr(self, "loss_mode_var") else "Classic VAE")
+        multi_enabled = bool(self.multi_resolution_loss_var.get()) if hasattr(self, "multi_resolution_loss_var") else False
+        noise_enabled = bool(self.noise_to_memory_loss_var.get()) if hasattr(self, "noise_to_memory_loss_var") else False
+        edge_enabled = bool(self.edge_consistency_loss_var.get()) if hasattr(self, "edge_consistency_loss_var") else False
+        patch_enabled = bool(self.patch_consistency_loss_var.get()) if hasattr(self, "patch_consistency_loss_var") else False
+        return {
+            "multi_resolution_loss": multi_enabled or mode == "Multi Resolution Loss",
+            "noise_to_memory_loss": noise_enabled or mode == "Noise-to-Memory Loss",
+            "edge_consistency_loss": edge_enabled or mode == "Edge Consistency Loss",
+            "patch_consistency_loss": patch_enabled or mode == "Patch Consistency Loss",
+        }
+
+    def _enabled_experiment_names(self, loss_mode: str | None = None) -> list[str]:
+        modules = self._experimental_loss_modules(loss_mode)
+        names = [label for key, label in APVD_71_EXPERIMENT_FLAGS.items() if modules.get(key)]
+        if hasattr(self, "structure_pyramid_denoise_var") and bool(self.structure_pyramid_denoise_var.get()):
+            names.append(APVD_71_EXPERIMENT_FLAGS["structure_pyramid_denoise"])
+        if hasattr(self, "progressive_memory_var") and bool(self.progressive_memory_var.get()):
+            names.append(APVD_71_EXPERIMENT_FLAGS["progressive_memory_reconstruction"])
+        if hasattr(self, "memory_fragment_training_var") and bool(self.memory_fragment_training_var.get()):
+            names.append(APVD_71_EXPERIMENT_FLAGS["memory_fragment_training"])
+        if hasattr(self, "train_pattern_decay_var") and bool(self.train_pattern_decay_var.get()):
+            names.append("Pattern Decay Denoiser Training")
+        if hasattr(self, "pattern_decay_reconstruction_var") and bool(self.pattern_decay_reconstruction_var.get()):
+            names.append(APVD_71_EXPERIMENT_FLAGS["pattern_decay_reconstruction"])
+        if hasattr(self, "decoder_mode_var") and self.decoder_mode_var.get() == "Hash Grid Assist":
+            names.append(APVD_71_EXPERIMENT_FLAGS["hash_grid_assist"])
+        return names
+
     @staticmethod
     def _loss_mode_weights(mode: str) -> dict[str, float]:
         """Return blend weights for APVD training losses.
@@ -1700,6 +1909,14 @@ class APVDApp:
             return {"base": 0.75, "l1": 0.15, "edge": 0.10}
         if mode == "Experimental Structure":
             return {"base": 0.65, "l1": 0.20, "edge": 0.15}
+        if mode == "Multi Resolution Loss":
+            return {"base": 0.82, "l1": 0.08, "edge": 0.00}
+        if mode == "Noise-to-Memory Loss":
+            return {"base": 0.85, "l1": 0.00, "edge": 0.00}
+        if mode == "Edge Consistency Loss":
+            return {"base": 0.88, "l1": 0.04, "edge": 0.00}
+        if mode == "Patch Consistency Loss":
+            return {"base": 0.88, "l1": 0.04, "edge": 0.00}
         return {"base": 1.00, "l1": 0.00, "edge": 0.00}
 
     @staticmethod
@@ -1725,6 +1942,238 @@ class APVDApp:
         gy = F.conv2d(tensor, kernel_y, padding=1, groups=channels)
         return torch.sqrt((gx * gx) + (gy * gy) + 1e-6)
 
+    def _apply_memory_fragment_corruption(self, clean: torch.Tensor, *, is_wavelet: bool) -> torch.Tensor:
+        """Create a damaged-memory input while keeping the clean tensor as the target.
+
+        This is intentionally APVD-shaped rather than a full DDPM. Every epoch can
+        show the same source image through different damage: noise, blur, color
+        drift, spatial jitter, and missing chunks. The VAE then learns to recover
+        the clean memory from fragments instead of only copying a perfect input.
+        """
+        if clean.ndim != 4:
+            return clean
+        strength = max(0.0, min(1.0, float(self.fragment_strength_var.get()))) if hasattr(self, "fragment_strength_var") else 0.0
+        if strength <= 0.0:
+            return clean
+        noise_amount = max(0.0, min(1.0, float(self.fragment_noise_var.get()))) if hasattr(self, "fragment_noise_var") else 0.35
+        blur_amount = max(0.0, min(1.0, float(self.fragment_blur_var.get()))) if hasattr(self, "fragment_blur_var") else 0.20
+        color_drift = max(0.0, min(0.75, float(self.fragment_color_drift_var.get()))) if hasattr(self, "fragment_color_drift_var") else 0.12
+        mask_amount = max(0.0, min(0.9, float(self.fragment_mask_var.get()))) if hasattr(self, "fragment_mask_var") else 0.18
+        crop_jitter = max(0.0, min(0.5, float(self.fragment_crop_jitter_var.get()))) if hasattr(self, "fragment_crop_jitter_var") else 0.08
+
+        x = clean.detach().clone().float()
+        batch, channels, height, width = x.shape
+        device = x.device
+        dtype = x.dtype
+        per_sample = torch.rand(batch, 1, 1, 1, device=device, dtype=dtype) * strength
+
+        # Spatial jitter makes tiny video/frame datasets behave less like one
+        # fixed camera memory. Roll is cheap and keeps tensor size unchanged.
+        if crop_jitter > 0.0 and height > 4 and width > 4:
+            max_dx = max(1, int(round(width * crop_jitter * strength)))
+            max_dy = max(1, int(round(height * crop_jitter * strength)))
+            jittered = []
+            for i in range(batch):
+                dx = int(torch.randint(-max_dx, max_dx + 1, (1,), device=device).item())
+                dy = int(torch.randint(-max_dy, max_dy + 1, (1,), device=device).item())
+                jittered.append(torch.roll(x[i], shifts=(dy, dx), dims=(-2, -1)))
+            jittered = torch.stack(jittered, dim=0)
+            x = torch.lerp(x, jittered, min(0.85, crop_jitter * 2.5 * strength))
+
+        # Blur fragments remove exact pixels so APVD has to reconstruct the
+        # broad visual idea rather than memorize sharp input/output identity.
+        if blur_amount > 0.0 and height >= 8 and width >= 8:
+            kernel = 3 if min(height, width) < 128 else 5
+            blurred = F.avg_pool2d(x, kernel_size=kernel, stride=1, padding=kernel // 2)
+            x = torch.lerp(x, blurred, min(0.95, blur_amount * strength))
+
+        # RGB color drift helps small cartoon/game datasets produce the DDPM-like
+        # amalgamation colors you are chasing. For wavelet tensors, skip channel
+        # color scaling because coefficients are not regular RGB channels.
+        if color_drift > 0.0 and not is_wavelet and channels >= 3:
+            scale = 1.0 + ((torch.rand(batch, channels, 1, 1, device=device, dtype=dtype) * 2.0 - 1.0) * color_drift * strength)
+            offset = (torch.rand(batch, channels, 1, 1, device=device, dtype=dtype) * 2.0 - 1.0) * color_drift * 0.5 * strength
+            x = x * scale + offset
+
+        # Mask missing chunks / damaged memory spots. Replacing with noisy color
+        # fields is closer to corrupted recall than simply blacking everything out.
+        if mask_amount > 0.0 and height >= 16 and width >= 16:
+            mask = torch.ones_like(x)
+            max_masks = 3
+            for i in range(batch):
+                n_rects = int(torch.randint(1, max_masks + 1, (1,), device=device).item())
+                for _ in range(n_rects):
+                    rect_w = int(torch.randint(max(4, width // 16), max(5, max(6, width // 4)), (1,), device=device).item())
+                    rect_h = int(torch.randint(max(4, height // 16), max(5, max(6, height // 4)), (1,), device=device).item())
+                    x0 = int(torch.randint(0, max(1, width - rect_w + 1), (1,), device=device).item())
+                    y0 = int(torch.randint(0, max(1, height - rect_h + 1), (1,), device=device).item())
+                    mask[i, :, y0:y0 + rect_h, x0:x0 + rect_w] = 0.0
+            damaged = torch.rand_like(x) if not is_wavelet else torch.randn_like(x) * 0.25
+            x = torch.lerp(x, (x * mask) + (damaged * (1.0 - mask)), min(0.95, mask_amount * strength))
+
+        if noise_amount > 0.0:
+            x = x + torch.randn_like(x) * noise_amount * per_sample
+
+        if is_wavelet:
+            return torch.nan_to_num(x, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        return torch.nan_to_num(x, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _multi_resolution_training_loss(recon: torch.Tensor, target: torch.Tensor, *, is_wavelet: bool) -> torch.Tensor:
+        """Compare reconstruction and target at several resolutions.
+
+        This gives APVD a cheap global-shape signal without changing the VAE.
+        At full resolution APVD can obsess over pixel noise; the lower scales push
+        it to remember the big silhouette first, then mid detail, then fine texture.
+        """
+        if recon.ndim != 4 or target.ndim != 4:
+            return recon.new_tensor(0.0)
+        recon_safe = torch.nan_to_num(recon, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        target_safe = torch.nan_to_num(target, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        _, _, height, width = recon_safe.shape
+        losses: list[torch.Tensor] = []
+        for scale, weight in ((1.0, 0.40), (0.5, 0.30), (0.25, 0.20), (0.125, 0.10)):
+            scaled_h = max(4, int(round(height * scale)))
+            scaled_w = max(4, int(round(width * scale)))
+            if scaled_h > height or scaled_w > width:
+                continue
+            if scale == 1.0:
+                r_scaled = recon_safe
+                t_scaled = target_safe
+            else:
+                r_scaled = F.interpolate(recon_safe, size=(scaled_h, scaled_w), mode="bilinear", align_corners=False)
+                t_scaled = F.interpolate(target_safe, size=(scaled_h, scaled_w), mode="bilinear", align_corners=False)
+            if is_wavelet:
+                losses.append(F.mse_loss(r_scaled, t_scaled, reduction="sum") * weight)
+            else:
+                losses.append(F.l1_loss(r_scaled.clamp(0.0, 1.0), t_scaled.clamp(0.0, 1.0), reduction="sum") * weight)
+        return sum(losses, recon.new_tensor(0.0))
+
+    def _patch_consistency_training_loss(
+        self,
+        recon: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        is_wavelet: bool,
+        patch_size: int = 32,
+        patch_samples: int = 4,
+    ) -> torch.Tensor:
+        """Compare random local memory chunks instead of only the whole frame.
+
+        This is the Phase 2 APVD equivalent of saying: the whole dream can stay
+        generalized, but small regions should still behave like believable local
+        memories. It is intentionally cheap and VAE-safe.
+        """
+        if recon.ndim != 4 or target.ndim != 4:
+            return recon.new_tensor(0.0)
+        recon_safe = torch.nan_to_num(recon, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        target_safe = torch.nan_to_num(target, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        _, _, height, width = recon_safe.shape
+        if height < 8 or width < 8:
+            return recon.new_tensor(0.0)
+        patch_size = max(4, min(int(patch_size), height, width))
+        patch_samples = max(1, min(16, int(patch_samples)))
+        max_y = max(1, height - patch_size + 1)
+        max_x = max(1, width - patch_size + 1)
+        total = recon.new_tensor(0.0)
+        for _ in range(patch_samples):
+            y = int(torch.randint(0, max_y, (1,), device=recon_safe.device).item())
+            x = int(torch.randint(0, max_x, (1,), device=recon_safe.device).item())
+            r_patch = recon_safe[..., y:y + patch_size, x:x + patch_size]
+            t_patch = target_safe[..., y:y + patch_size, x:x + patch_size]
+            if is_wavelet:
+                total = total + F.mse_loss(r_patch, t_patch, reduction="sum")
+            else:
+                total = total + F.l1_loss(r_patch.clamp(0.0, 1.0), t_patch.clamp(0.0, 1.0), reduction="sum")
+        # Scale sampled patches back toward full-frame magnitude so the weight
+        # behaves consistently at 256/512 without needing a totally new LR.
+        coverage = max(1.0, float(patch_size * patch_size * patch_samples))
+        return total * ((height * width) / coverage)
+
+    def _noise_to_memory_training_loss(
+        self,
+        batch: torch.Tensor,
+        clean_latents: torch.Tensor,
+        *,
+        is_wavelet: bool,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Train APVD to recover an image from corrupted latent memory.
+
+        This borrows the useful DDPM idea -- learn from noised information -- but
+        keeps APVD as the normal lightweight VAE with its built-in latent denoiser.
+        """
+        if self.model is None or not hasattr(self.model, "predict_latent_noise"):
+            return batch.new_tensor(0.0), {"noise_to_memory_loss": 0.0, "noise_prediction_loss": 0.0}
+        clean_latents = clean_latents.float()
+        batch_size = clean_latents.size(0)
+        t = torch.rand(batch_size, 1, device=clean_latents.device, dtype=clean_latents.dtype)
+        noise = torch.randn_like(clean_latents)
+        noise_scale = 0.25 + (1.25 * t)
+        noisy_latents = clean_latents + (noise * noise_scale)
+        predicted_noise = torch.nan_to_num(self.model.predict_latent_noise(noisy_latents, t), nan=0.0, posinf=0.0, neginf=0.0)
+        recovered_latents = noisy_latents - (predicted_noise * noise_scale)
+        recovered = self.model.decode(recovered_latents)
+        recovered_safe = torch.nan_to_num(recovered, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        batch_safe = torch.nan_to_num(batch, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+        if is_wavelet:
+            memory_loss = F.mse_loss(recovered_safe, batch_safe, reduction="sum")
+        else:
+            memory_loss = F.binary_cross_entropy(
+                recovered_safe.clamp(1e-6, 1.0 - 1e-6),
+                batch_safe.clamp(0.0, 1.0),
+                reduction="sum",
+            )
+        prediction_loss = F.mse_loss(predicted_noise, noise, reduction="mean") * clean_latents.numel()
+        total = memory_loss + (0.05 * prediction_loss)
+        return total, {
+            "noise_to_memory_loss": float(memory_loss.detach().float().item()),
+            "noise_prediction_loss": float(prediction_loss.detach().float().item()),
+        }
+
+    def _structure_pyramid_denoise(self, tensor: torch.Tensor, *, show_steps: bool = False) -> torch.Tensor:
+        """Generation-only APVD cleanup using a low-to-high resolution pyramid.
+
+        It never changes model weights. It gently blends coarse structure back
+        into the image/tensor, then returns a tiny detail residual so it does not
+        become smeared soup. Classic APVD behavior is untouched when disabled.
+        """
+        if tensor.ndim not in (3, 4):
+            return tensor
+        single = tensor.ndim == 3
+        current = tensor.unsqueeze(0) if single else tensor
+        current = torch.nan_to_num(current.float(), nan=0.0, posinf=4.0, neginf=-4.0)
+        original = current.clone()
+        levels = max(1, min(5, int(self.structure_pyramid_levels_var.get())))
+        strength = max(0.0, min(1.0, float(self.structure_pyramid_strength_var.get())))
+        if strength <= 0.0:
+            return tensor
+        _, channels, height, width = current.shape
+        if height < 8 or width < 8:
+            return tensor
+        for level in range(1, levels + 1):
+            divisor = 2 ** level
+            low_h = max(4, height // divisor)
+            low_w = max(4, width // divisor)
+            if low_h >= height or low_w >= width:
+                continue
+            coarse = F.interpolate(current, size=(low_h, low_w), mode="bilinear", align_corners=False)
+            coarse = F.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)
+            level_strength = min(0.65, strength * (0.38 / level))
+            current = torch.lerp(current, coarse, level_strength)
+            if show_steps:
+                preview = current
+                self._display_image(tensor_to_pil(self._decode_model_output_to_rgb(preview)))
+                self.root.update()
+                self._after(35)
+        blur = F.avg_pool2d(original, kernel_size=3, stride=1, padding=1)
+        detail = original - blur
+        current = current + (detail * (0.10 * strength))
+        if channels == 12 or self._model_uses_wavelet():
+            current = current.clamp(-4.0, 4.0)
+        else:
+            current = current.clamp(0.0, 1.0)
+        return current.squeeze(0) if single else current
+
     def _apvd_training_loss(
         self,
         recon: torch.Tensor,
@@ -1734,6 +2183,11 @@ class APVDApp:
         *,
         is_wavelet: bool,
         loss_mode: str,
+        multi_resolution_enabled: bool = False,
+        edge_consistency_enabled: bool = False,
+        patch_consistency_enabled: bool = False,
+        patch_size: int = 32,
+        patch_samples: int = 4,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """APVD loss with optional structure/detail stabilizers.
 
@@ -1753,6 +2207,9 @@ class APVDApp:
         total = base_loss * float(weights["base"])
         l1_loss = recon.new_tensor(0.0)
         edge_loss = recon.new_tensor(0.0)
+        multi_resolution_loss = recon.new_tensor(0.0)
+        edge_consistency_loss = recon.new_tensor(0.0)
+        patch_consistency_loss = recon.new_tensor(0.0)
         if weights["l1"] > 0.0:
             recon_l1 = torch.nan_to_num(recon, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
             batch_l1 = torch.nan_to_num(batch, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
@@ -1763,13 +2220,32 @@ class APVDApp:
             batch_edges = self._sobel_edges_for_loss(batch)
             edge_loss = F.l1_loss(recon_edges, batch_edges, reduction="sum")
             total = total + (edge_loss * float(weights["edge"]))
+        if multi_resolution_enabled:
+            multi_resolution_loss = self._multi_resolution_training_loss(recon, batch, is_wavelet=is_wavelet)
+            total = total + (multi_resolution_loss * 0.12)
+        if edge_consistency_enabled:
+            recon_edges = self._sobel_edges_for_loss(recon)
+            batch_edges = self._sobel_edges_for_loss(batch)
+            edge_consistency_loss = F.l1_loss(recon_edges, batch_edges, reduction="sum")
+            total = total + (edge_consistency_loss * 0.10)
+        if patch_consistency_enabled:
+            patch_consistency_loss = self._patch_consistency_training_loss(
+                recon, batch, is_wavelet=is_wavelet, patch_size=patch_size, patch_samples=patch_samples
+            )
+            total = total + (patch_consistency_loss * 0.08)
         metrics = {
             "base_loss": float(base_loss.detach().float().item()),
             "l1_loss": float(l1_loss.detach().float().item()),
             "edge_loss": float(edge_loss.detach().float().item()),
+            "multi_resolution_loss": float(multi_resolution_loss.detach().float().item()),
+            "edge_consistency_loss": float(edge_consistency_loss.detach().float().item()),
+            "patch_consistency_loss": float(patch_consistency_loss.detach().float().item()),
             "base_weight": float(weights["base"]),
             "l1_weight": float(weights["l1"]),
             "edge_weight": float(weights["edge"]),
+            "multi_resolution_weight": 0.12 if multi_resolution_enabled else 0.0,
+            "edge_consistency_weight": 0.10 if edge_consistency_enabled else 0.0,
+            "patch_consistency_weight": 0.08 if patch_consistency_enabled else 0.0,
         }
         return total, metrics
 
@@ -2242,6 +2718,18 @@ Output Image Count
 Cleanup Iterations
 - Reconstructs outputs repeatedly for cleanup.
 
+Progressive Memory Reconstruction
+- Runs a generation-only decode/re-encode reflection loop so a latent can evolve into a stranger but still structured APVD memory before the final image is shown.
+
+Memory Drift
+- Adds controlled randomness during progressive reflection.
+
+Structure Pull
+- Keeps progressive reflection anchored to the original memory so it does not collapse into pure noise.
+
+Novelty Strength
+- Amplifies the model's self-created differences for more alien APVD dream behavior.
+
 
 [DIFFUSION]
 
@@ -2500,6 +2988,84 @@ Hardware Status
         self._grid_row(training_frame, 17, "Video Stride:", video_stride_spin)
         max_frames_spin = ttk.Spinbox(training_frame, from_=0, to=1_000_000, increment=100, width=8, textvariable=self.video_max_frames_var)
         self._grid_row(training_frame, 17, "Max Frames:", max_frames_spin, column=2)
+
+        lab_frame = self._make_section(content, EXPERIMENTAL_LAB_SECTION, open_by_default=False)
+        self._category_label(lab_frame, "Phase 1 Training Experiments", 0)
+        ttk.Checkbutton(lab_frame, text="Multi Resolution Loss", variable=self.multi_resolution_loss_var).grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Label(lab_frame, text="Compares 100%, 50%, 25%, and 12.5% scales so APVD remembers the big shape first.", style="SurfaceMuted.TLabel").grid(row=1, column=1, columnspan=4, sticky=tk.W, pady=4)
+        ttk.Checkbutton(lab_frame, text="Noise-to-Memory Loss", variable=self.noise_to_memory_loss_var).grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Label(lab_frame, text="Adds latent corruption/recovery training without becoming a full DDPM.", style="SurfaceMuted.TLabel").grid(row=2, column=1, columnspan=4, sticky=tk.W, pady=4)
+
+        self._category_label(lab_frame, "Phase 2 Training Experiments", 3)
+        ttk.Checkbutton(lab_frame, text="Edge Consistency Loss", variable=self.edge_consistency_loss_var).grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Label(lab_frame, text="Forces outlines, UI boxes, roads, object borders, and character silhouettes to stay less melted.", style="SurfaceMuted.TLabel").grid(row=4, column=1, columnspan=4, sticky=tk.W, pady=4)
+        ttk.Checkbutton(lab_frame, text="Patch Consistency Loss", variable=self.patch_consistency_loss_var).grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Label(lab_frame, text="Samples local chunks so grass/sky/UI/characters keep believable texture instead of becoming rainbow oatmeal.", style="SurfaceMuted.TLabel").grid(row=5, column=1, columnspan=4, sticky=tk.W, pady=4)
+        patch_size_spin = ttk.Spinbox(lab_frame, from_=4, to=128, increment=4, width=6, textvariable=self.patch_loss_size_var)
+        self._grid_row(lab_frame, 6, "Patch Size:", patch_size_spin)
+        patch_samples_spin = ttk.Spinbox(lab_frame, from_=1, to=16, increment=1, width=6, textvariable=self.patch_loss_samples_var)
+        self._grid_row(lab_frame, 6, "Patch Samples:", patch_samples_spin, column=2)
+
+        self._category_label(lab_frame, "Generation Denoise Experiments", 7)
+        ttk.Checkbutton(lab_frame, text="Structure Pyramid Denoise", variable=self.structure_pyramid_denoise_var).grid(row=8, column=0, sticky=tk.W, pady=4)
+        pyramid_levels = ttk.Spinbox(lab_frame, from_=1, to=5, increment=1, width=6, textvariable=self.structure_pyramid_levels_var)
+        self._grid_row(lab_frame, 8, "Pyramid Levels:", pyramid_levels, column=1)
+        pyramid_strength = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.structure_pyramid_strength_var), "scale")
+        self._grid_row(lab_frame, 9, "Pyramid Strength:", pyramid_strength)
+        ttk.Label(lab_frame, text="Runs after latent cleanup. It can stack with Mini Diffusion and normal cleanup iterations.", style="SurfaceMuted.TLabel").grid(row=9, column=2, columnspan=3, sticky=tk.W, pady=4)
+        ttk.Checkbutton(lab_frame, text="Progressive Memory Reconstruction", variable=self.progressive_memory_var).grid(row=10, column=0, sticky=tk.W, pady=(10, 4))
+        progressive_mode_box = ttk.Combobox(lab_frame, textvariable=self.progressive_memory_mode_var, values=PROGRESSIVE_MEMORY_MODE_CHOICES, state="readonly", width=14)
+        self._grid_row(lab_frame, 10, "Reflection Mode:", progressive_mode_box, column=1)
+        progressive_mode_box.bind("<<ComboboxSelected>>", self._on_progressive_memory_mode_changed)
+        progressive_steps_spin = ttk.Spinbox(lab_frame, from_=1, to=24, increment=1, width=6, textvariable=self.progressive_memory_steps_var)
+        self._grid_row(lab_frame, 11, "Reflection Steps:", progressive_steps_spin)
+        progressive_drift = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=0.6, resolution=0.01, orient=tk.HORIZONTAL, length=180, variable=self.progressive_memory_drift_var), "scale")
+        self._grid_row(lab_frame, 11, "Memory Drift:", progressive_drift, column=2)
+        progressive_pull = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.progressive_memory_structure_pull_var), "scale")
+        self._grid_row(lab_frame, 12, "Structure Pull:", progressive_pull)
+        progressive_novelty = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.progressive_memory_novelty_var), "scale")
+        self._grid_row(lab_frame, 12, "Novelty Strength:", progressive_novelty, column=2)
+        ttk.Label(lab_frame, text="Decodes, re-encodes, then nudges the latent several times so APVD can evolve a structured-but-weird memory before the final image is shown.", style="SurfaceMuted.TLabel", wraplength=620).grid(row=13, column=0, columnspan=5, sticky=tk.W, pady=(2, 8))
+
+        self._category_label(lab_frame, "Memory Fragment Training", 14)
+        ttk.Checkbutton(lab_frame, text="Memory Fragment Training", variable=self.memory_fragment_training_var).grid(row=15, column=0, sticky=tk.W, pady=(8, 4))
+        frag_strength = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.fragment_strength_var), "scale")
+        self._grid_row(lab_frame, 15, "Fragment Strength:", frag_strength, column=1)
+        frag_noise = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.fragment_noise_var), "scale")
+        self._grid_row(lab_frame, 16, "Noise:", frag_noise)
+        frag_blur = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.fragment_blur_var), "scale")
+        self._grid_row(lab_frame, 16, "Blur:", frag_blur, column=2)
+        frag_color = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=0.5, resolution=0.01, orient=tk.HORIZONTAL, length=180, variable=self.fragment_color_drift_var), "scale")
+        self._grid_row(lab_frame, 17, "Color Drift:", frag_color)
+        frag_mask = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=0.75, resolution=0.01, orient=tk.HORIZONTAL, length=180, variable=self.fragment_mask_var), "scale")
+        self._grid_row(lab_frame, 17, "Memory Masking:", frag_mask, column=2)
+        frag_crop = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=0.35, resolution=0.01, orient=tk.HORIZONTAL, length=180, variable=self.fragment_crop_jitter_var), "scale")
+        self._grid_row(lab_frame, 18, "Crop Jitter:", frag_crop)
+        ttk.Label(lab_frame, text="Trains APVD to reconstruct the clean image from damaged versions of the same image. This turns small datasets into many broken-memory variants without needing a full DDPM.", style="SurfaceMuted.TLabel", wraplength=620).grid(row=19, column=0, columnspan=5, sticky=tk.W, pady=(2, 8))
+
+        self._category_label(lab_frame, "Pattern Decay Reconstruction", 20)
+        ttk.Checkbutton(lab_frame, text="Train Pattern Decay Denoiser", variable=self.train_pattern_decay_var).grid(row=21, column=0, sticky=tk.W, pady=(8, 4))
+        ttk.Checkbutton(lab_frame, text="Use Pattern Decay Reconstruction", variable=self.pattern_decay_reconstruction_var).grid(row=21, column=1, columnspan=2, sticky=tk.W, pady=(8, 4))
+        pattern_steps_spin = ttk.Spinbox(lab_frame, from_=1, to=80, increment=1, width=6, textvariable=self.pattern_decay_steps_var)
+        self._grid_row(lab_frame, 22, "Decay Steps:", pattern_steps_spin)
+        pattern_corruption = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.5, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.pattern_decay_corruption_var), "scale")
+        self._grid_row(lab_frame, 22, "Corruption:", pattern_corruption, column=2)
+        pattern_anchor = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, length=180, variable=self.pattern_decay_anchor_var), "scale")
+        self._grid_row(lab_frame, 23, "Memory Anchor:", pattern_anchor)
+        pattern_drift = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=0.75, resolution=0.01, orient=tk.HORIZONTAL, length=180, variable=self.pattern_decay_drift_var), "scale")
+        self._grid_row(lab_frame, 23, "Hallucination Drift:", pattern_drift, column=2)
+        ttk.Checkbutton(lab_frame, text="Final APVD cleanup", variable=self.pattern_decay_final_cleanup_var).grid(row=24, column=0, sticky=tk.W, pady=4)
+        ttk.Label(lab_frame, text="Image-space decay loop: corrupts the decoded APVD memory, then denoises it over multiple passes so random spatial patterns can become weird-but-structured APVD dreams.", style="SurfaceMuted.TLabel", wraplength=620).grid(row=25, column=0, columnspan=5, sticky=tk.W, pady=(2, 8))
+
+        self._category_label(lab_frame, "Decoder Experiments", 26)
+        decoder_box = ttk.Combobox(lab_frame, textvariable=self.decoder_mode_var, values=DECODER_MODE_CHOICES, state="readonly", width=26)
+        self._grid_row(lab_frame, 27, "Decoder Mode:", decoder_box)
+        decoder_box.bind("<<ComboboxSelected>>", self._on_decoder_mode_changed)
+        hash_size_spin = ttk.Spinbox(lab_frame, from_=4, to=128, increment=4, width=6, textvariable=self.hash_grid_size_var)
+        self._grid_row(lab_frame, 28, "Hash Grid Size:", hash_size_spin)
+        hash_strength = self._register_theme_widget(tk.Scale(lab_frame, from_=0.0, to=0.5, resolution=0.01, orient=tk.HORIZONTAL, length=180, variable=self.hash_grid_strength_var), "scale")
+        self._grid_row(lab_frame, 28, "Hash Strength:", hash_strength, column=2)
+        ttk.Label(lab_frame, text="Hash Grid Assist is Phase 2: it adds a tiny learned texture/detail grid to the decoder. Old models still load. Enable it before fine-tuning/retraining if you want the new parameters to learn.", style="SurfaceMuted.TLabel", wraplength=620).grid(row=29, column=0, columnspan=5, sticky=tk.W, pady=(2, 8))
 
         gen_tools_frame = self._make_section(content, "Generation Tools", open_by_default=True)
         self._category_label(gen_tools_frame, "Generate And Cycle", 0)
@@ -3099,6 +3665,22 @@ Hardware Status
             metadata.setdefault("output_size", checkpoint.get("output_size"))
             metadata.setdefault("version", checkpoint.get("version"))
             metadata.setdefault("reconstruction_mode", checkpoint.get("reconstruction_mode", "RGB VAE"))
+            metadata.setdefault("decoder_mode", checkpoint.get("decoder_mode", "Standard Decoder"))
+            metadata.setdefault("hash_grid_size", checkpoint.get("hash_grid_size"))
+            metadata.setdefault("hash_grid_strength", checkpoint.get("hash_grid_strength"))
+            metadata.setdefault("train_pattern_decay_denoiser", metadata.get("train_pattern_decay_denoiser", False))
+            metadata.setdefault("pattern_decay_reconstruction", metadata.get("pattern_decay_reconstruction", False))
+            metadata.setdefault("memory_fragment_training", metadata.get("memory_fragment_training", False))
+            metadata.setdefault("fragment_strength", metadata.get("fragment_strength"))
+            metadata.setdefault("fragment_noise", metadata.get("fragment_noise"))
+            metadata.setdefault("fragment_blur", metadata.get("fragment_blur"))
+            metadata.setdefault("fragment_color_drift", metadata.get("fragment_color_drift"))
+            metadata.setdefault("fragment_mask", metadata.get("fragment_mask"))
+            metadata.setdefault("fragment_crop_jitter", metadata.get("fragment_crop_jitter"))
+            metadata.setdefault("pattern_decay_steps", metadata.get("pattern_decay_steps"))
+            metadata.setdefault("pattern_decay_corruption", metadata.get("pattern_decay_corruption"))
+            metadata.setdefault("pattern_decay_anchor", metadata.get("pattern_decay_anchor"))
+            metadata.setdefault("pattern_decay_drift", metadata.get("pattern_decay_drift"))
             metadata.setdefault("in_channels", checkpoint.get("in_channels", 3))
             metadata.setdefault("out_channels", checkpoint.get("out_channels", 3))
 
@@ -3121,6 +3703,23 @@ Hardware Status
             "saved_at": metadata.get("saved_at"),
             "version": metadata.get("version"),
             "reconstruction_mode": metadata.get("reconstruction_mode", "RGB VAE"),
+            "decoder_mode": metadata.get("decoder_mode", "Standard Decoder"),
+            "hash_grid_size": metadata.get("hash_grid_size"),
+            "hash_grid_strength": metadata.get("hash_grid_strength"),
+            "memory_fragment_training": metadata.get("memory_fragment_training"),
+            "fragment_strength": metadata.get("fragment_strength"),
+            "fragment_noise": metadata.get("fragment_noise"),
+            "fragment_blur": metadata.get("fragment_blur"),
+            "fragment_color_drift": metadata.get("fragment_color_drift"),
+            "fragment_mask": metadata.get("fragment_mask"),
+            "fragment_crop_jitter": metadata.get("fragment_crop_jitter"),
+            "train_pattern_decay_denoiser": metadata.get("train_pattern_decay_denoiser"),
+            "pattern_decay_reconstruction": metadata.get("pattern_decay_reconstruction"),
+            "pattern_decay_steps": metadata.get("pattern_decay_steps"),
+            "pattern_decay_corruption": metadata.get("pattern_decay_corruption"),
+            "pattern_decay_anchor": metadata.get("pattern_decay_anchor"),
+            "pattern_decay_drift": metadata.get("pattern_decay_drift"),
+            "apvd_71_experiments": metadata.get("apvd_71_experiments"),
             "path": model_path,
         }
 
@@ -3135,6 +3734,11 @@ Hardware Status
             f"Model: {details['path'].name}",
             f"Folder: {relative_path.parent if relative_path.parent != Path('.') else 'Models'}",
             f"Reconstruction Mode: {self._format_metadata_value(details.get('reconstruction_mode'))}",
+            f"Decoder Mode: {self._format_metadata_value(details.get('decoder_mode'))}",
+            f"Hash Grid: size={self._format_metadata_value(details.get('hash_grid_size'))}, strength={self._format_metadata_value(details.get('hash_grid_strength'))}",
+            f"APVD 7.1 Experiments: {self._format_metadata_value(details.get('apvd_71_experiments'))}",
+            f"Memory Fragment: enabled={self._format_metadata_value(details.get('memory_fragment_training'))}, strength={self._format_metadata_value(details.get('fragment_strength'))}, noise={self._format_metadata_value(details.get('fragment_noise'))}, blur={self._format_metadata_value(details.get('fragment_blur'))}, color={self._format_metadata_value(details.get('fragment_color_drift'))}, mask={self._format_metadata_value(details.get('fragment_mask'))}, jitter={self._format_metadata_value(details.get('fragment_crop_jitter'))}",
+            f"Pattern Decay: trained={self._format_metadata_value(details.get('train_pattern_decay_denoiser'))}, use={self._format_metadata_value(details.get('pattern_decay_reconstruction'))}, steps={self._format_metadata_value(details.get('pattern_decay_steps'))}, corruption={self._format_metadata_value(details.get('pattern_decay_corruption'))}, anchor={self._format_metadata_value(details.get('pattern_decay_anchor'))}, drift={self._format_metadata_value(details.get('pattern_decay_drift'))}",
             f"Dataset label: {self._format_metadata_value(details.get('dataset_label'))}",
             f"Dataset image count: {self._format_metadata_value(details.get('dataset_image_count'))}",
             f"Epochs per chunk: {self._format_metadata_value(details.get('epochs'))}",
@@ -3770,9 +4374,53 @@ Hardware Status
             self.pause_btn.config(text="Pause Training")
             self.status_var.set("Training resumed.")
 
-    def _wait_if_training_paused(self) -> bool:
-        while self.is_training and not self.training_pause_event.is_set():
-            time.sleep(0.1)
+    @staticmethod
+    def _release_dataloader_resources(data_loader) -> None:
+        """Tear down a DataLoader's persistent worker processes and any
+        pinned-memory prefetch queue they're holding. With
+        persistent_workers=True, workers (and the batches they've cached/
+        prefetched) normally stay alive for the lifetime of the DataLoader
+        object, including while training is paused. This forcibly shuts
+        them down so a pause actually gives RAM back instead of just
+        freezing the training step while workers keep idling with memory
+        held."""
+        if data_loader is None:
+            return
+        try:
+            iterator = getattr(data_loader, "_iterator", None)
+            if iterator is not None:
+                shutdown = getattr(iterator, "_shutdown_workers", None)
+                if callable(shutdown):
+                    shutdown()
+                data_loader._iterator = None
+        except Exception:
+            logger.debug("Non-fatal error while releasing DataLoader workers on pause.", exc_info=True)
+
+    def _wait_if_training_paused(self, data_loader=None) -> bool:
+        """Blocks while training is paused. If the pause lasts longer than a
+        short grace period, releases the DataLoader's worker processes,
+        pinned prefetch buffers, and cached CUDA memory so RAM/VRAM usage
+        actually drops instead of sitting at its pre-pause level. Returns
+        False if training was stopped while waiting. If True is returned
+        and a data_loader was provided, the caller should check
+        self._dataloader_released_on_pause and rebuild the loader (and
+        resume the underlying iterator at the same position) before
+        continuing, since the old loader's workers were shut down."""
+        self._dataloader_released_on_pause = False
+        if self.is_training and not self.training_pause_event.is_set():
+            paused_at = time.perf_counter()
+            released = False
+            while self.is_training and not self.training_pause_event.is_set():
+                if not released and (time.perf_counter() - paused_at) >= 1.0:
+                    self._after(0, lambda: self.status_var.set("Training paused. Freeing memory..."))
+                    self._release_dataloader_resources(data_loader)
+                    if getattr(self.device, "type", "") == "cuda":
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    released = True
+                    self._dataloader_released_on_pause = True
+                    self._after(0, lambda: self.status_var.set("Training paused. Memory freed."))
+                time.sleep(0.1)
         return self.is_training
 
     @staticmethod
@@ -3788,6 +4436,19 @@ Hardware Status
                 dataset_folders.append(child)
         return dataset_folders
 
+    @staticmethod
+    def _json_safe_metadata(metadata: dict) -> dict:
+        """Returns a copy of a metadata dict with any pathlib.Path values
+        (e.g. the in-memory 'path' field used for display purposes) converted
+        to plain strings. Checkpoints are loaded with weights_only=True by
+        default, whose restricted unpickler does not allow WindowsPath/
+        PosixPath objects unless explicitly allowlisted, so saving a raw Path
+        into a checkpoint silently makes that file unloadable later."""
+        safe = {}
+        for key, value in metadata.items():
+            safe[key] = str(value) if isinstance(value, Path) else value
+        return safe
+
     def _build_model_checkpoint(self) -> dict:
         if self.model is None:
             raise ValueError("No model is loaded.")
@@ -3801,9 +4462,12 @@ Hardware Status
             "in_channels": in_ch,
             "out_channels": out_ch,
             "output_activation": getattr(self.model, "output_activation", "identity" if mode == "Wavelet" else "sigmoid"),
+            "decoder_mode": getattr(self.model, "decoder_mode", "Standard Decoder"),
+            "hash_grid_size": int(getattr(self.model, "hash_grid_size", 32)),
+            "hash_grid_strength": float(getattr(self.model, "hash_grid_strength", 0.08)),
             "reconstruction_mode": mode,
-            "version": "2.3-mini-diffusion",
-            "training_metadata": dict(self.last_training_metadata),
+            "version": "2.4-apvd-7.1-lab",
+            "training_metadata": self._json_safe_metadata(dict(self.last_training_metadata)),
         }
 
     def _next_available_model_path(self, target_dir: Path, model_name: str) -> Path:
@@ -3962,27 +4626,48 @@ Hardware Status
         in_channels = 12 if is_wavelet else 3
         out_channels = 12 if is_wavelet else 3
         output_activation = "identity" if is_wavelet else "sigmoid"
+        decoder_mode = self.decoder_mode_var.get() if hasattr(self, "decoder_mode_var") else "Standard Decoder"
+        if decoder_mode not in {"Standard Decoder", "Hash Grid Assist"}:
+            decoder_mode = "Standard Decoder"
+            self._after(0, lambda: self.decoder_mode_var.set("Standard Decoder"))
+        hash_grid_size = max(4, min(128, int(self.hash_grid_size_var.get()))) if hasattr(self, "hash_grid_size_var") else 32
+        hash_grid_strength = max(0.0, min(1.0, float(self.hash_grid_strength_var.get()))) if hasattr(self, "hash_grid_strength_var") else 0.08
 
         with self.model_lock:
-            if resume_state is None and (
+            needs_new_model = resume_state is None and (
                 self.model is None
                 or getattr(self.model, "output_size", model_output_size) != model_output_size
                 or int(getattr(self.model, "in_channels", 3)) != in_channels
                 or getattr(self.model, "output_activation", "sigmoid") != output_activation
-            ):
-                self.model = VAE(
+                or getattr(self.model, "decoder_mode", "Standard Decoder") != decoder_mode
+                or (decoder_mode == "Hash Grid Assist" and int(getattr(self.model, "hash_grid_size", hash_grid_size)) != hash_grid_size)
+            )
+            if needs_new_model:
+                old_model = self.model
+                new_model = VAE(
                     latent_dim=256,
                     in_channels=in_channels,
                     out_channels=out_channels,
                     output_size=model_output_size,
                     output_activation=output_activation,
+                    decoder_mode=decoder_mode,
+                    hash_grid_size=hash_grid_size,
+                    hash_grid_strength=hash_grid_strength,
                 ).to(self.device)
+                if old_model is not None and getattr(old_model, "output_size", None) == model_output_size and int(getattr(old_model, "in_channels", -1)) == in_channels:
+                    try:
+                        new_model.load_state_dict(old_model.state_dict(), strict=False)
+                    except Exception:
+                        logger.debug("Could not transfer existing weights into the selected decoder mode.", exc_info=True)
+                self.model = new_model
                 self.loaded_model_path = None
 
         precision = self._resolve_precision_settings()
         loss_mode = self.loss_mode_var.get() if hasattr(self, "loss_mode_var") else "Classic VAE"
         if loss_mode not in LOSS_MODE_CHOICES:
             loss_mode = "Classic VAE"
+        experiment_modules = self._experimental_loss_modules(loss_mode)
+        enabled_experiments = self._enabled_experiment_names(loss_mode)
         amp_enabled = bool(precision["autocast_enabled"])
         scaler_enabled = bool(precision["scaler_enabled"])
         autocast_dtype = precision["autocast_dtype"]
@@ -4037,7 +4722,8 @@ Hardware Status
             completed_steps = min(total_steps, resume_epoch * total_batches + resume_skip_batches)
 
         self._after(0, lambda: self.load_progress_var.set(0.0))
-        self._after(0, lambda p=str(precision["requested"]), r=str(precision["resolved"]), lm=loss_mode: self.status_var.set((f"Training using precision: {p} → {r}" if p == "Auto Recommended" else f"Training using precision: {r}") + f" | Loss: {lm}."))
+        experiment_note = ", ".join(enabled_experiments) if enabled_experiments else "No APVD 7.1 experiments"
+        self._after(0, lambda p=str(precision["requested"]), r=str(precision["resolved"]), lm=loss_mode, ex=experiment_note: self.status_var.set((f"Training using precision: {p} → {r}" if p == "Auto Recommended" else f"Training using precision: {r}") + f" | Loss: {lm} | Lab: {ex}."))
 
         prefix_parts: list[str] = []
         if batch_index is not None and batch_total is not None:
@@ -4049,86 +4735,151 @@ Hardware Status
         for epoch in range(resume_epoch, n_epochs):
             if not self.is_training:
                 return False
-            if not self._wait_if_training_paused():
+            if not self._wait_if_training_paused(data_loader):
                 return False
+            if self._dataloader_released_on_pause:
+                data_loader = self._build_training_dataloader(dataset, batch_size=batch_size, loader_workers=loader_workers, prefetch_batches=prefetch_batches, shuffle=True)
 
             skip_in_this_epoch = resume_skip_batches if epoch == resume_epoch else 0
             epoch_loss = 0.0
             processed_in_epoch = 0
-            for batch_idx, batch in enumerate(data_loader, start=1):
-                if batch_idx <= skip_in_this_epoch:
-                    continue
-                if not self.is_training:
-                    return False
-                if not self._wait_if_training_paused():
-                    return False
 
-                step_start = time.perf_counter()
-                batch = batch.to(self.device, non_blocking=non_blocking).float()
-                batch = self._sanitize_model_batch(batch, is_wavelet=is_wavelet)
+            # This epoch's batches are walked inside a retry loop because a
+            # pause that lasts long enough to free memory shuts down the
+            # current DataLoader's worker processes (see
+            # _wait_if_training_paused / _release_dataloader_resources). That
+            # invalidates the enumerate(data_loader) iterator already in
+            # flight, so on resume we rebuild a fresh DataLoader and re-enter
+            # this loop, skipping the batches already processed this epoch.
+            while True:
+                interrupted_by_pause_release = False
+                for batch_idx, batch in enumerate(data_loader, start=1):
+                    if batch_idx <= skip_in_this_epoch:
+                        continue
+                    if not self.is_training:
+                        return False
+                    if not self._wait_if_training_paused(data_loader):
+                        return False
+                    if self._dataloader_released_on_pause:
+                        data_loader = self._build_training_dataloader(dataset, batch_size=batch_size, loader_workers=loader_workers, prefetch_batches=prefetch_batches, shuffle=True)
+                        skip_in_this_epoch = batch_idx - 1
+                        interrupted_by_pause_release = True
+                        break
 
-                if len(preview_parts) < MAX_TRAINING_PREVIEW_IMAGES:
-                    remaining = MAX_TRAINING_PREVIEW_IMAGES - len(preview_parts)
-                    preview_parts.extend(batch[:remaining].detach().cpu())
+                    step_start = time.perf_counter()
+                    batch = batch.to(self.device, non_blocking=non_blocking).float()
+                    batch = self._sanitize_model_batch(batch, is_wavelet=is_wavelet)
+                    clean_batch = batch
+                    memory_fragment_enabled = bool(self.memory_fragment_training_var.get()) if hasattr(self, "memory_fragment_training_var") else False
+                    model_input = self._apply_memory_fragment_corruption(clean_batch, is_wavelet=is_wavelet) if memory_fragment_enabled else clean_batch
 
-                optimizer.zero_grad(set_to_none=True)
+                    if len(preview_parts) < MAX_TRAINING_PREVIEW_IMAGES:
+                        remaining = MAX_TRAINING_PREVIEW_IMAGES - len(preview_parts)
+                        preview_parts.extend(clean_batch[:remaining].detach().cpu())
 
-                autocast_kwargs = {"enabled": amp_enabled}
-                if autocast_dtype is not None:
-                    autocast_kwargs["dtype"] = autocast_dtype
-                with torch.amp.autocast("cuda", **autocast_kwargs):
-                    recon, mu, logvar = self.model(batch)
-                with torch.amp.autocast("cuda", enabled=False):
-                    recon_loss, structure_loss_metrics = self._apvd_training_loss(
-                        recon.float(),
-                        batch.float(),
-                        mu.float(),
-                        logvar.float(),
-                        is_wavelet=is_wavelet,
-                        loss_mode=loss_mode,
-                    )
-                    denoise_loss = latent_denoiser_loss(self.model, mu.detach().float())
-                    loss = recon_loss + (0.25 * denoise_loss)
+                    optimizer.zero_grad(set_to_none=True)
 
-                if self.nan_guard_var.get() and not torch.isfinite(loss.detach()):
-                    old_lr = learning_rate
-                    learning_rate = max(learning_rate * 0.5, 1e-7)
-                    for group in optimizer.param_groups:
-                        group["lr"] = learning_rate
-                    if scaler_enabled:
-                        scaler.update()
-                    self._after(0, lambda old=old_lr, new=learning_rate: self.status_var.set(f"NaN/Inf loss caught. Skipped batch and lowered LR from {old:.6f} to {new:.6f}."))
-                    continue
+                    autocast_kwargs = {"enabled": amp_enabled}
+                    if autocast_dtype is not None:
+                        autocast_kwargs["dtype"] = autocast_dtype
+                    with torch.amp.autocast("cuda", **autocast_kwargs):
+                        recon, mu, logvar = self.model(model_input)
+                    with torch.amp.autocast("cuda", enabled=False):
+                        recon_loss, structure_loss_metrics = self._apvd_training_loss(
+                            recon.float(),
+                            clean_batch.float(),
+                            mu.float(),
+                            logvar.float(),
+                            is_wavelet=is_wavelet,
+                            loss_mode=loss_mode,
+                            multi_resolution_enabled=bool(experiment_modules.get("multi_resolution_loss", False)),
+                            edge_consistency_enabled=bool(experiment_modules.get("edge_consistency_loss", False)),
+                            patch_consistency_enabled=bool(experiment_modules.get("patch_consistency_loss", False)),
+                            patch_size=max(4, min(128, int(self.patch_loss_size_var.get()))),
+                            patch_samples=max(1, min(16, int(self.patch_loss_samples_var.get()))),
+                        )
+                        denoise_loss = latent_denoiser_loss(self.model, mu.detach().float())
+                        loss = recon_loss + (0.25 * denoise_loss)
+                        pattern_decay_enabled = bool(self.train_pattern_decay_var.get()) if hasattr(self, "train_pattern_decay_var") else False
+                        if pattern_decay_enabled:
+                            pattern_loss = pattern_decay_denoiser_loss(
+                                self.model,
+                                clean_batch.float(),
+                                max_noise_strength=max(0.05, min(1.5, float(self.pattern_decay_corruption_var.get()))),
+                                is_wavelet=is_wavelet,
+                            )
+                            loss = loss + (0.20 * pattern_loss)
+                            structure_loss_metrics["pattern_decay_loss"] = float(pattern_loss.detach().item())
+                            structure_loss_metrics["pattern_decay_weight"] = 0.20
+                        else:
+                            structure_loss_metrics.setdefault("pattern_decay_loss", 0.0)
+                            structure_loss_metrics.setdefault("pattern_decay_weight", 0.0)
+                        if memory_fragment_enabled:
+                            structure_loss_metrics["memory_fragment_training"] = 1.0
+                            structure_loss_metrics["fragment_strength"] = float(self.fragment_strength_var.get())
+                            structure_loss_metrics["fragment_noise"] = float(self.fragment_noise_var.get())
+                            structure_loss_metrics["fragment_blur"] = float(self.fragment_blur_var.get())
+                            structure_loss_metrics["fragment_color_drift"] = float(self.fragment_color_drift_var.get())
+                            structure_loss_metrics["fragment_mask"] = float(self.fragment_mask_var.get())
+                            structure_loss_metrics["fragment_crop_jitter"] = float(self.fragment_crop_jitter_var.get())
+                        else:
+                            structure_loss_metrics.setdefault("memory_fragment_training", 0.0)
+                        if bool(experiment_modules.get("noise_to_memory_loss", False)):
+                            noise_memory_loss, noise_memory_metrics = self._noise_to_memory_training_loss(
+                                clean_batch.float(),
+                                mu.detach().float(),
+                                is_wavelet=is_wavelet,
+                            )
+                            loss = loss + (0.18 * noise_memory_loss)
+                            structure_loss_metrics.update(noise_memory_metrics)
+                            structure_loss_metrics["noise_to_memory_weight"] = 0.18
+                        else:
+                            structure_loss_metrics.setdefault("noise_to_memory_loss", 0.0)
+                            structure_loss_metrics.setdefault("noise_prediction_loss", 0.0)
+                            structure_loss_metrics.setdefault("noise_to_memory_weight", 0.0)
 
-                scaler.scale(loss).backward()
-                if self.nan_guard_var.get():
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                epoch_loss += loss.detach().float().item()
-                processed_in_epoch += 1
+                    if self.nan_guard_var.get() and not torch.isfinite(loss.detach()):
+                        old_lr = learning_rate
+                        learning_rate = max(learning_rate * 0.5, 1e-7)
+                        for group in optimizer.param_groups:
+                            group["lr"] = learning_rate
+                        if scaler_enabled:
+                            scaler.update()
+                        self._after(0, lambda old=old_lr, new=learning_rate: self.status_var.set(f"NaN/Inf loss caught. Skipped batch and lowered LR from {old:.6f} to {new:.6f}."))
+                        continue
 
-                completed_steps += 1
-                if training_intensity < 100 and throttle_cap > 0.0:
-                    step_seconds = max(0.0, time.perf_counter() - step_start)
-                    sleep_seconds = min(throttle_cap, step_seconds * ((100 - training_intensity) / max(1, training_intensity)))
-                    if sleep_seconds > 0.001 and self.is_training:
-                        time.sleep(sleep_seconds)
-                progress = min(100.0, (completed_steps / total_steps) * 100.0)
-                elapsed = time.perf_counter() - train_start
-                eta = (total_steps - completed_steps) * (elapsed / max(1, completed_steps))
-                running_avg = epoch_loss / max(1, processed_in_epoch)
-                metrics = {
-                    "dataset_label": dataset_label, "epoch": epoch + 1, "epochs": n_epochs,
-                    "batch": batch_idx, "total_batches": total_batches, "loss": running_avg,
-                    "elapsed": elapsed, "eta": eta, "progress": progress,
-                    "step": completed_steps, "total_steps": total_steps
-                }
-                self._handle_training_visual_snapshot(batch, recon.detach(), metrics, force=batch_idx == 1 or completed_steps >= total_steps)
-                self._after(0, lambda p=progress: self.load_progress_var.set(p))
-                if batch_idx == 1 or batch_idx % 350 == 0 or batch_idx == total_batches:
-                    self._after(0, lambda e=epoch, b=batch_idx, a=running_avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(f"{p}{label} | Epoch {e+1}/{n_epochs} | Batch {b}/{total_batches} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"))
+                    scaler.scale(loss).backward()
+                    if self.nan_guard_var.get():
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    epoch_loss += loss.detach().float().item()
+                    processed_in_epoch += 1
+
+                    completed_steps += 1
+                    if training_intensity < 100 and throttle_cap > 0.0:
+                        step_seconds = max(0.0, time.perf_counter() - step_start)
+                        sleep_seconds = min(throttle_cap, step_seconds * ((100 - training_intensity) / max(1, training_intensity)))
+                        if sleep_seconds > 0.001 and self.is_training:
+                            time.sleep(sleep_seconds)
+                    progress = min(100.0, (completed_steps / total_steps) * 100.0)
+                    elapsed = time.perf_counter() - train_start
+                    eta = (total_steps - completed_steps) * (elapsed / max(1, completed_steps))
+                    running_avg = epoch_loss / max(1, processed_in_epoch)
+                    metrics = {
+                        "dataset_label": dataset_label, "epoch": epoch + 1, "epochs": n_epochs,
+                        "batch": batch_idx, "total_batches": total_batches, "loss": running_avg,
+                        "elapsed": elapsed, "eta": eta, "progress": progress,
+                        "step": completed_steps, "total_steps": total_steps
+                    }
+                    self._handle_training_visual_snapshot(batch, recon.detach(), metrics, force=batch_idx == 1 or completed_steps >= total_steps)
+                    self._after(0, lambda p=progress: self.load_progress_var.set(p))
+                    if batch_idx == 1 or batch_idx % 350 == 0 or batch_idx == total_batches:
+                        self._after(0, lambda e=epoch, b=batch_idx, a=running_avg, t=eta, p=prefix, label=dataset_label: self.status_var.set(f"{p}{label} | Epoch {e+1}/{n_epochs} | Batch {b}/{total_batches} | Loss: {a:.0f} | ETA: {self._format_duration(t)}"))
+
+                if not interrupted_by_pause_release:
+                    break
 
             avg = epoch_loss / max(1, processed_in_epoch)
             elapsed = time.perf_counter() - train_start
@@ -4164,10 +4915,35 @@ Hardware Status
             "precision_dtype": str(precision["dtype_label"]),
             "loss_mode": loss_mode,
             "loss_mode_weights": self._loss_mode_weights(loss_mode),
+            "apvd_71_experiments": enabled_experiments,
+            "multi_resolution_loss": bool(experiment_modules.get("multi_resolution_loss", False)),
+            "noise_to_memory_loss": bool(experiment_modules.get("noise_to_memory_loss", False)),
+            "edge_consistency_loss": bool(experiment_modules.get("edge_consistency_loss", False)),
+            "patch_consistency_loss": bool(experiment_modules.get("patch_consistency_loss", False)),
+            "patch_loss_size": max(4, min(128, int(self.patch_loss_size_var.get()))),
+            "patch_loss_samples": max(1, min(16, int(self.patch_loss_samples_var.get()))),
+            "structure_pyramid_denoise": bool(self.structure_pyramid_denoise_var.get()),
+            "memory_fragment_training": bool(self.memory_fragment_training_var.get()),
+            "fragment_strength": float(self.fragment_strength_var.get()),
+            "fragment_noise": float(self.fragment_noise_var.get()),
+            "fragment_blur": float(self.fragment_blur_var.get()),
+            "fragment_color_drift": float(self.fragment_color_drift_var.get()),
+            "fragment_mask": float(self.fragment_mask_var.get()),
+            "fragment_crop_jitter": float(self.fragment_crop_jitter_var.get()),
+            "train_pattern_decay_denoiser": bool(self.train_pattern_decay_var.get()),
+            "pattern_decay_reconstruction": bool(self.pattern_decay_reconstruction_var.get()),
+            "pattern_decay_steps": int(self.pattern_decay_steps_var.get()),
+            "pattern_decay_corruption": float(self.pattern_decay_corruption_var.get()),
+            "pattern_decay_anchor": float(self.pattern_decay_anchor_var.get()),
+            "pattern_decay_drift": float(self.pattern_decay_drift_var.get()),
+            "pattern_decay_final_cleanup": bool(self.pattern_decay_final_cleanup_var.get()),
+            "decoder_mode": decoder_mode,
+            "hash_grid_size": hash_grid_size,
+            "hash_grid_strength": hash_grid_strength,
             "mixed_precision": bool(amp_enabled),
             "nan_guard": bool(self.nan_guard_var.get()), "batch_load_workers": loader_workers,
             "prefetch_batches": prefetch_batches, "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "version": "2.3-mini-diffusion",
+            "version": "2.4-apvd-7.1-lab",
             "reconstruction_mode": self._get_reconstruction_mode(),
             "input_channels": in_channels, "output_channels": out_channels
         }
@@ -4286,20 +5062,41 @@ Hardware Status
 
         output_size = tuple(checkpoint.get("output_size", (256, 256)))
         output_activation = checkpoint.get("output_activation", "identity" if mode == "Wavelet" else "sigmoid")
+        state_dict = checkpoint.get("model_state_dict", {})
+        decoder_mode = checkpoint.get("decoder_mode")
+        if decoder_mode not in {"Standard Decoder", "Hash Grid Assist"}:
+            metadata = checkpoint.get("training_metadata") if isinstance(checkpoint.get("training_metadata"), dict) else {}
+            decoder_mode = metadata.get("decoder_mode")
+        if decoder_mode not in {"Standard Decoder", "Hash Grid Assist"}:
+            decoder_mode = "Hash Grid Assist" if any(str(key).startswith("hash_grid_assist.") for key in state_dict.keys()) else "Standard Decoder"
+        hash_grid_size = int(checkpoint.get("hash_grid_size", 32))
+        hash_grid_strength = float(checkpoint.get("hash_grid_strength", 0.08))
+        grid_weight = state_dict.get("hash_grid_assist.grid") if isinstance(state_dict, dict) else None
+        if hasattr(grid_weight, "shape") and len(grid_weight.shape) >= 4:
+            hash_grid_size = int(grid_weight.shape[-1])
         loaded_model = VAE(
             latent_dim=checkpoint.get("latent_dim", 256),
             in_channels=in_ch,
             out_channels=out_ch,
             output_size=output_size,
             output_activation=output_activation,
+            decoder_mode=decoder_mode,
+            hash_grid_size=hash_grid_size,
+            hash_grid_strength=hash_grid_strength,
         ).to(self.device)
-        load_result = loaded_model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        load_result = loaded_model.load_state_dict(state_dict, strict=False)
         loaded_model.eval()
         
         with self.model_lock:
             self.model = loaded_model
             self.loaded_model_path = Path(path)
             self.last_training_metadata = self._extract_model_training_metadata(checkpoint, self.loaded_model_path)
+        if hasattr(self, "decoder_mode_var"):
+            self.decoder_mode_var.set(decoder_mode)
+        if hasattr(self, "hash_grid_size_var"):
+            self.hash_grid_size_var.set(hash_grid_size)
+        if hasattr(self, "hash_grid_strength_var"):
+            self.hash_grid_strength_var.set(hash_grid_strength)
         if len(output_size) == 2 and all(isinstance(v, int) for v in output_size):
             display_size = self._rgb_size_for_wavelet_output(output_size) if mode == "Wavelet" else output_size
             self.resolution_var.set(int(display_size[0]))
@@ -4309,7 +5106,8 @@ Hardware Status
         if not has_denoiser:
             self.use_mini_diffusion_var.set(False)
         note = " Mini diffusion ready." if has_denoiser else " Legacy checkpoint loaded; mini diffusion disabled until retrained."
-        self.status_var.set(f"Model loaded: {path.name}.{note}")
+        decoder_note = f" Decoder: {decoder_mode}." if decoder_mode != "Standard Decoder" else ""
+        self.status_var.set(f"Model loaded: {path.name}.{note}{decoder_note}")
 
         if self.latent_diffusion is not None and self.latent_diffusion.config.latent_dim != self.model.latent_dim:
             self.latent_diffusion = None
@@ -6243,7 +7041,7 @@ Hardware Status
                 stored_latent = latent_device.detach().cpu()
                 self.last_generated_latents.append(stored_latent)
                 if save_memory:
-                    self._remember_generation(image, stored_latent, mode=mode, extra={"diffusion_steps": int(self.diffusion_steps_var.get()), "diffusion_strength": float(self.diffusion_strength_var.get()), "iterations": int(self.iterations_var.get())})
+                    self._remember_generation(image, stored_latent, mode=mode, extra={"diffusion_steps": int(self.diffusion_steps_var.get()), "diffusion_strength": float(self.diffusion_strength_var.get()), "iterations": int(self.iterations_var.get()), "structure_pyramid_denoise": bool(self.structure_pyramid_denoise_var.get()), "progressive_memory_reconstruction": bool(self.progressive_memory_var.get()), "progressive_memory_mode": self.progressive_memory_mode_var.get(), "progressive_memory_steps": int(self.progressive_memory_steps_var.get()), "progressive_memory_drift": float(self.progressive_memory_drift_var.get()), "progressive_memory_structure_pull": float(self.progressive_memory_structure_pull_var.get()), "progressive_memory_novelty": float(self.progressive_memory_novelty_var.get()), "pattern_decay_reconstruction": bool(self.pattern_decay_reconstruction_var.get()), "pattern_decay_steps": int(self.pattern_decay_steps_var.get()), "pattern_decay_corruption": float(self.pattern_decay_corruption_var.get()), "pattern_decay_anchor": float(self.pattern_decay_anchor_var.get()), "pattern_decay_drift": float(self.pattern_decay_drift_var.get()), "pattern_decay_final_cleanup": bool(self.pattern_decay_final_cleanup_var.get()), "apvd_71_experiments": self._enabled_experiment_names()})
 
         if len(images) == 1:
             final_image = images[0]
@@ -6306,7 +7104,10 @@ Hardware Status
         self._render_latent_gallery(latents, mode=self._current_mode_label(), numbered=False, status_label="", save_memory=not self.auto_cycle_var.get())
         if not self.auto_cycle_var.get() and not self.dream_cycle_var.get():
             mode = f"Blend x{blend_count}" if blend_enabled else "Single anchor"
-            self.status_var.set(f"Generated ({self.personality_var.get()} | Intensity: {intensity:.1f} | {mode} | Diffusion: {'on' if use_diffusion else 'off'} x{diffusion_steps} | Outputs: {output_count})")
+            pyramid_note = " | Structure Pyramid" if bool(self.structure_pyramid_denoise_var.get()) else ""
+            progressive_note = f" | Progressive Memory {self.progressive_memory_mode_var.get()}" if bool(self.progressive_memory_var.get()) else ""
+            pattern_note = f" | Pattern Decay x{int(self.pattern_decay_steps_var.get())}" if bool(self.pattern_decay_reconstruction_var.get()) else ""
+            self.status_var.set(f"Generated ({self.personality_var.get()} | Intensity: {intensity:.1f} | {mode} | Diffusion: {'on' if use_diffusion else 'off'} x{diffusion_steps}{pyramid_note}{progressive_note}{pattern_note} | Outputs: {output_count})")
 
     def _decode_latent(self, z, show_steps: bool = False):
         current = z
@@ -6315,6 +7116,8 @@ Hardware Status
             current = diffusion.polish_latent(current, strength=float(self.latent_diffusion_strength_var.get()))
         if self.use_mini_diffusion_var.get():
             current = self._mini_diffusion_refine(current, show_steps=show_steps)
+        if bool(self.progressive_memory_var.get()):
+            current = self._progressive_memory_reconstruct(current, show_steps=show_steps)
 
         recon = self.model.decode(current)
         iterations = max(0, int(self.iterations_var.get()))
@@ -6325,7 +7128,146 @@ Hardware Status
                 self._display_image(tensor_to_pil(self._decode_model_output_to_rgb(recon)))
                 self.root.update()
                 self._after(50)
+        if bool(self.pattern_decay_reconstruction_var.get()):
+            recon = self._pattern_decay_reconstruct(recon, show_steps=show_steps)
+        if bool(self.structure_pyramid_denoise_var.get()):
+            recon = self._structure_pyramid_denoise(recon, show_steps=show_steps)
         return recon
+
+    def _pattern_decay_reconstruct(self, recon: torch.Tensor, show_steps: bool = False) -> torch.Tensor:
+        """Image-space Pattern Decay Reconstruction loop.
+
+        Unlike latent-only cleanup, this lets random spatial patterns survive.
+        The decoded APVD image is corrupted, repeatedly denoised by the small
+        pattern-decay module, optionally anchored back through the APVD VAE, and
+        given small drift between passes. This borrows the useful iterative
+        behavior of diffusion while keeping APVD as the memory core.
+        """
+        if self.model is None:
+            return recon
+        steps = max(1, min(80, int(self.pattern_decay_steps_var.get())))
+        corruption = max(0.0, min(1.5, float(self.pattern_decay_corruption_var.get())))
+        anchor_strength = max(0.0, min(1.0, float(self.pattern_decay_anchor_var.get())))
+        drift = max(0.0, min(0.75, float(self.pattern_decay_drift_var.get())))
+        is_wavelet = self._model_uses_wavelet()
+
+        original = self._sanitize_model_batch(recon.detach().float(), is_wavelet=is_wavelet)
+        current = original.clone()
+        if corruption > 0.0:
+            current = current + torch.randn_like(current) * corruption
+            current = self._sanitize_model_batch(current, is_wavelet=is_wavelet)
+
+        for step_idx in range(steps):
+            if not torch.isfinite(current).all():
+                current = self._sanitize_model_batch(current, is_wavelet=is_wavelet)
+            progress = (step_idx + 1) / float(steps)
+            # High t early means stronger repair; low t late means smaller changes.
+            t_value = max(0.02, 1.0 - progress)
+            t = torch.full((current.size(0), 1), t_value, device=current.device, dtype=current.dtype)
+            denoised = self.model.pattern_decay_reconstruct(current, t)
+            denoised = self._sanitize_model_batch(denoised, is_wavelet=is_wavelet)
+
+            if anchor_strength > 0.0:
+                mu_anchor, _ = self.model.encode(denoised)
+                anchored = self.model.decode(mu_anchor)
+                anchored = self._sanitize_model_batch(anchored, is_wavelet=is_wavelet)
+                # Anchor fades softer near the end so Pattern Decay can keep
+                # some hallucinated layout instead of collapsing to the same average.
+                anchor_now = min(0.85, anchor_strength * (0.75 - 0.35 * progress))
+                denoised = torch.lerp(denoised, anchored, max(0.0, anchor_now))
+
+            if drift > 0.0 and step_idx < steps - 1:
+                drift_now = drift * (0.65 - 0.45 * progress)
+                if drift_now > 0.0:
+                    denoised = denoised + torch.randn_like(denoised) * drift_now
+
+            # A tiny original pull avoids total collapse, but remains weaker
+            # than the denoiser so it can still produce strange results.
+            current = torch.lerp(denoised, original, 0.03)
+            current = self._sanitize_model_batch(current, is_wavelet=is_wavelet)
+
+            if show_steps:
+                self._display_image(tensor_to_pil(self._decode_model_output_to_rgb(current)))
+                self.root.update()
+                self._after(50)
+
+        if bool(self.pattern_decay_final_cleanup_var.get()):
+            mu_final, _ = self.model.encode(current)
+            cleaned = self.model.decode(mu_final)
+            current = torch.lerp(current, self._sanitize_model_batch(cleaned, is_wavelet=is_wavelet), 0.35)
+            current = self._sanitize_model_batch(current, is_wavelet=is_wavelet)
+        return current
+
+    def _progressive_memory_reconstruct(self, z: torch.Tensor, show_steps: bool = False) -> torch.Tensor:
+        """Generation-only APVD memory reflection loop.
+
+        This does not change the checkpoint architecture. It repeatedly decodes
+        the current latent, re-encodes what APVD actually drew, then nudges the
+        latent toward a controlled mixture of self-reflection, original-memory
+        pull, novelty, and small drift. The purpose is not sharper detail; it is
+        structured randomness that feels like APVD is thinking about the memory
+        for several passes before showing it.
+        """
+        if self.model is None:
+            return z
+        steps = max(1, min(24, int(self.progressive_memory_steps_var.get())))
+        drift = max(0.0, min(0.6, float(self.progressive_memory_drift_var.get())))
+        structure_pull = max(0.0, min(1.0, float(self.progressive_memory_structure_pull_var.get())))
+        novelty = max(0.0, min(1.0, float(self.progressive_memory_novelty_var.get())))
+        reflection_strength = max(0.05, min(0.85, self._progressive_memory_reflection_strength()))
+
+        current = torch.nan_to_num(z.detach().float().clone(), nan=0.0, posinf=8.0, neginf=-8.0)
+        if current.ndim == 1:
+            current = current.unsqueeze(0)
+        if current.ndim > 2:
+            current = current.reshape(current.size(0), -1)
+        original = current.clone()
+        previous_reflection = None
+        latent_limit = max(6.0, float(original.detach().abs().max().item()) * 1.25 if original.numel() else 6.0)
+        latent_limit = min(latent_limit, 16.0)
+
+        for step_idx in range(steps):
+            progress = (step_idx + 1) / float(steps)
+            recon = self.model.decode(current)
+            recon = self._sanitize_model_batch(recon, is_wavelet=self._model_uses_wavelet())
+            reflected, _ = self.model.encode(recon)
+            reflected = torch.nan_to_num(reflected.detach().float(), nan=0.0, posinf=latent_limit, neginf=-latent_limit)
+
+            # Move toward what APVD actually drew. This is the core "memory
+            # reflection" step: the model sees its own dream and updates the
+            # memory from that interpretation.
+            current = torch.lerp(current, reflected, reflection_strength)
+
+            # Novelty amplifies the differences APVD creates during the loop so
+            # the output can become strange/alien while still being scene-shaped.
+            if novelty > 0.0:
+                self_difference = reflected - original
+                current = current + (self_difference * novelty * (0.08 + 0.18 * progress))
+                if previous_reflection is not None:
+                    memory_motion = reflected - previous_reflection
+                    current = current + (memory_motion * novelty * 0.18)
+
+            # Drift adds controlled randomness, strongest early in the loop and
+            # softer near the end so the final passes can settle into structure.
+            if drift > 0.0:
+                drift_schedule = drift * (1.0 - (0.45 * progress))
+                current = current + (torch.randn_like(current) * drift_schedule)
+
+            # Structure pull prevents total rainbow soup by keeping some gravity
+            # around the original latent seed.
+            if structure_pull > 0.0:
+                current = torch.lerp(current, original, min(0.30, structure_pull * 0.08))
+
+            current = torch.nan_to_num(current, nan=0.0, posinf=latent_limit, neginf=-latent_limit).clamp(-latent_limit, latent_limit)
+            previous_reflection = reflected
+
+            if show_steps:
+                preview = self.model.decode(current)
+                self._display_image(tensor_to_pil(self._decode_model_output_to_rgb(preview)))
+                self.root.update()
+                self._after(50)
+
+        return current
 
     def _mini_diffusion_refine(self, z, show_steps: bool = False):
         steps = max(1, int(self.diffusion_steps_var.get()))

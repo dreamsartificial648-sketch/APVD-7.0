@@ -38,6 +38,73 @@ class LatentDenoiser(nn.Module):
         return self.net(torch.cat((z, t_features), dim=1))
 
 
+class PatternDecayDenoiser(nn.Module):
+    """Tiny image-space denoiser for APVD Pattern Decay Reconstruction.
+
+    It is deliberately much smaller than a DDPM UNet. APVD still does the
+    memory reconstruction; this module only learns how corrupted image fields
+    tend to decay back toward the dataset's visual patterns.
+    """
+
+    def __init__(self, channels: int = 3, hidden_dim: int = 48):
+        super().__init__()
+        channels = int(channels)
+        hidden_dim = int(hidden_dim)
+        self.channels = channels
+        self.hidden_dim = hidden_dim
+        self.in_proj = nn.Conv2d(channels + 1, hidden_dim, kernel_size=3, padding=1)
+        self.down1 = nn.Conv2d(hidden_dim, hidden_dim * 2, kernel_size=3, stride=2, padding=1)
+        self.mid1 = nn.Conv2d(hidden_dim * 2, hidden_dim * 2, kernel_size=3, padding=1)
+        self.mid2 = nn.Conv2d(hidden_dim * 2, hidden_dim * 2, kernel_size=3, padding=1)
+        self.up1 = nn.ConvTranspose2d(hidden_dim * 2, hidden_dim, kernel_size=4, stride=2, padding=1)
+        self.out_proj = nn.Conv2d(hidden_dim, channels, kernel_size=3, padding=1)
+
+    def forward(self, noisy: Tensor, t: Tensor) -> Tensor:
+        if t.ndim == 1:
+            t = t.reshape(-1, 1, 1, 1)
+        elif t.ndim == 2:
+            t = t.reshape(t.size(0), 1, 1, 1)
+        t = t.to(device=noisy.device, dtype=noisy.dtype).clamp(0.0, 1.0)
+        t_map = t.expand(noisy.size(0), 1, noisy.size(-2), noisy.size(-1))
+        h0 = F.silu(self.in_proj(torch.cat((noisy, t_map), dim=1)))
+        h1 = F.silu(self.down1(h0))
+        h1 = F.silu(self.mid1(h1))
+        h1 = F.silu(self.mid2(h1))
+        up = F.silu(self.up1(h1))
+        if up.shape[-2:] != h0.shape[-2:]:
+            up = F.interpolate(up, size=h0.shape[-2:], mode="bilinear", align_corners=False)
+        residual = torch.tanh(self.out_proj(up + h0))
+        # Residual is scaled by corruption level: early noisy steps can move
+        # more, final steps make small corrections instead of repainting.
+        return noisy + residual * (0.05 + 0.95 * t)
+
+
+class HashGridAssist(nn.Module):
+    """Optional learned multi-resolution-ish texture bias for APVD's decoder.
+
+    This is intentionally tiny and optional. When disabled, the VAE architecture
+    and checkpoint format stay the same as older APVD models. When enabled, the
+    grid starts at zero so a standard checkpoint can be upgraded with
+    load_state_dict(..., strict=False) and then fine-tuned.
+    """
+
+    def __init__(self, out_channels: int, grid_size: int = 32, strength: float = 0.08):
+        super().__init__()
+        grid_size = max(4, min(128, int(grid_size)))
+        self.out_channels = int(out_channels)
+        self.grid_size = int(grid_size)
+        self.strength = float(max(0.0, min(1.0, strength)))
+        self.grid = nn.Parameter(torch.zeros(1, self.out_channels, self.grid_size, self.grid_size))
+        # Starts slightly open, but the zero grid means there is no image change
+        # until training learns useful detail.
+        self.gate = nn.Parameter(torch.tensor(-1.5, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        grid = F.interpolate(self.grid, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        gate = torch.sigmoid(self.gate).to(dtype=x.dtype)
+        return x + (grid.to(dtype=x.dtype) * gate * self.strength)
+
+
 class VAE(nn.Module):
     """Convolutional VAE with configurable output resolution and latent denoiser."""
 
@@ -48,6 +115,10 @@ class VAE(nn.Module):
         out_channels: int = 3,
         output_size: tuple[int, int] = (256, 256),
         output_activation: str = "sigmoid",
+        decoder_mode: str = "Standard Decoder",
+        hash_grid_size: int = 32,
+        hash_grid_strength: float = 0.08,
+        pattern_decay_hidden: int = 48,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -55,6 +126,10 @@ class VAE(nn.Module):
         self.out_channels = out_channels
         self.output_size = output_size
         self.output_activation = output_activation
+        self.decoder_mode = "Hash Grid Assist" if decoder_mode == "Hash Grid Assist" else "Standard Decoder"
+        self.hash_grid_size = max(4, min(128, int(hash_grid_size)))
+        self.hash_grid_strength = float(max(0.0, min(1.0, hash_grid_strength)))
+        self.pattern_decay_hidden = max(16, min(128, int(pattern_decay_hidden)))
 
         # Downsample while preserving flexibility for different input resolutions.
         self.encoder = nn.Sequential(
@@ -99,6 +174,12 @@ class VAE(nn.Module):
             nn.LeakyReLU(0.2),
             nn.ConvTranspose2d(32, out_channels, kernel_size=4, stride=2, padding=1),
         )
+        self.hash_grid_assist = (
+            HashGridAssist(out_channels, grid_size=self.hash_grid_size, strength=self.hash_grid_strength)
+            if self.decoder_mode == "Hash Grid Assist"
+            else None
+        )
+        self.pattern_decay_denoiser = PatternDecayDenoiser(out_channels, hidden_dim=self.pattern_decay_hidden)
 
     def encode(self, x: Tensor) -> tuple[Tensor, Tensor]:
         h = self.encoder(x)
@@ -119,6 +200,8 @@ class VAE(nn.Module):
         h = h.reshape(h.size(0), 512, 4, 4)
         x = self.decoder(h)
         x = F.interpolate(x, size=self.output_size, mode="bilinear", align_corners=False)
+        if self.hash_grid_assist is not None:
+            x = self.hash_grid_assist(x)
         if self.output_activation == "sigmoid":
             return torch.sigmoid(x)
         if self.output_activation == "tanh":
@@ -133,6 +216,9 @@ class VAE(nn.Module):
 
     def predict_latent_noise(self, z: Tensor, t: Tensor) -> Tensor:
         return self.latent_denoiser(z, t)
+
+    def pattern_decay_reconstruct(self, noisy: Tensor, t: Tensor) -> Tensor:
+        return self.pattern_decay_denoiser(noisy, t)
 
 
 def vae_loss(
@@ -177,6 +263,40 @@ def latent_denoiser_loss(
     noisy_latents = clean_latents + (noise * noise_scale)
     predicted_noise = model.predict_latent_noise(noisy_latents, t)
     return F.mse_loss(predicted_noise, noise)
+
+
+
+def pattern_decay_denoiser_loss(
+    model: VAE,
+    clean_images: Tensor,
+    max_noise_strength: float = 0.85,
+    is_wavelet: bool = False,
+) -> Tensor:
+    """Train APVD's image-space Pattern Decay denoiser.
+
+    A clean training tensor is corrupted with random noise strengths. The small
+    denoiser learns to pull it back toward the original image/tensor. This gives
+    APVD a DDPM-like image-field habit without replacing APVD with a full DDPM.
+    """
+    clean = torch.nan_to_num(clean_images.float(), nan=0.0, posinf=4.0, neginf=-4.0)
+    batch = clean.size(0)
+    t = torch.rand(batch, 1, device=clean.device, dtype=clean.dtype)
+    noise = torch.randn_like(clean)
+    strength = max(0.01, float(max_noise_strength))
+    view_shape = (batch, 1, 1, 1)
+    noisy = clean + noise * t.reshape(view_shape) * strength
+    if is_wavelet:
+        noisy = noisy.clamp(-4.0, 4.0)
+        target = clean.clamp(-4.0, 4.0)
+    else:
+        noisy = noisy.clamp(0.0, 1.0)
+        target = clean.clamp(0.0, 1.0)
+    predicted = model.pattern_decay_reconstruct(noisy, t).float()
+    if is_wavelet:
+        predicted = torch.nan_to_num(predicted, nan=0.0, posinf=4.0, neginf=-4.0).clamp(-4.0, 4.0)
+    else:
+        predicted = torch.nan_to_num(predicted, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    return F.mse_loss(predicted, target)
 
 
 def get_device() -> torch.device:
